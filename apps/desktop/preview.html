@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NoUSB OS Switcher Preview</title>
+    <style>
+      :root {
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #17201a;
+        background: #f6f7f4;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+      }
+
+      main {
+        width: min(1240px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 24px 0 40px;
+      }
+
+      header {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 24px;
+        align-items: end;
+        padding: 20px 0 22px;
+        border-bottom: 1px solid #d5dbd0;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        max-width: 760px;
+        font-size: 34px;
+        line-height: 1.08;
+        letter-spacing: 0;
+      }
+
+      h2 {
+        font-size: 18px;
+      }
+
+      h3 {
+        font-size: 15px;
+      }
+
+      .eyebrow,
+      .muted,
+      td,
+      small {
+        color: #5c675d;
+      }
+
+      .eyebrow {
+        margin-bottom: 8px;
+        font-weight: 800;
+      }
+
+      .statusbar {
+        display: grid;
+        grid-template-columns: repeat(3, auto);
+        gap: 10px;
+      }
+
+      .pill,
+      .risk {
+        display: inline-flex;
+        align-items: center;
+        width: fit-content;
+        min-height: 28px;
+        padding: 4px 9px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 800;
+        background: #e8f3eb;
+        color: #1e6942;
+      }
+
+      .risk.high {
+        background: #fff1bf;
+        color: #715000;
+      }
+
+      .risk.critical {
+        background: #ffe4d8;
+        color: #923315;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 260px 1fr;
+        gap: 18px;
+        margin-top: 18px;
+      }
+
+      nav,
+      section,
+      .panel {
+        border: 1px solid #d5dbd0;
+        border-radius: 8px;
+        background: #fff;
+      }
+
+      nav {
+        height: fit-content;
+        padding: 10px;
+      }
+
+      .navbutton {
+        width: 100%;
+        min-height: 44px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        padding: 10px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: #17201a;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .navbutton[aria-selected="true"],
+      .navbutton:hover {
+        background: #eef3ed;
+      }
+
+      .content {
+        display: grid;
+        gap: 18px;
+      }
+
+      section {
+        padding: 18px;
+      }
+
+      .section-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: start;
+        margin-bottom: 14px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .panel {
+        padding: 14px;
+      }
+
+      .panel > * + * {
+        margin-top: 10px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        padding: 11px 8px;
+        border-top: 1px solid #e3e7df;
+        text-align: left;
+        vertical-align: top;
+        font-size: 14px;
+      }
+
+      th {
+        color: #273127;
+        font-size: 12px;
+        text-transform: uppercase;
+      }
+
+      code,
+      pre {
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      }
+
+      pre {
+        overflow: auto;
+        margin: 0;
+        padding: 12px;
+        border-radius: 6px;
+        background: #111a14;
+        color: #eef8ef;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .steps {
+        display: grid;
+        gap: 8px;
+        padding: 0;
+        margin: 0;
+        list-style: none;
+      }
+
+      .steps li {
+        display: grid;
+        grid-template-columns: 110px 1fr;
+        gap: 12px;
+        padding: 10px;
+        border: 1px solid #e2e7dd;
+        border-radius: 6px;
+      }
+
+      .copy {
+        min-height: 34px;
+        padding: 6px 10px;
+        border: 1px solid #bfd0c1;
+        border-radius: 6px;
+        background: #f8fbf7;
+        color: #163820;
+        font-weight: 800;
+        cursor: pointer;
+      }
+
+      .commands {
+        display: grid;
+        gap: 10px;
+      }
+
+      .command-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 10px;
+        align-items: center;
+      }
+
+      @media (max-width: 900px) {
+        header,
+        .layout,
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        .statusbar {
+          grid-template-columns: 1fr;
+        }
+
+        h1 {
+          font-size: 28px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">NoUSB OS Switcher</p>
+          <h1>Safe installer staging, preflight planning, and recovery rehearsal</h1>
+        </div>
+        <div class="statusbar" aria-label="Safety status">
+          <span class="pill">Default boot changes disabled</span>
+          <span class="pill">Profiles validated</span>
+          <span class="pill">Diagnostics redacted</span>
+        </div>
+      </header>
+
+      <div class="layout">
+        <nav aria-label="Views">
+          <button class="navbutton" data-view="overview" aria-selected="true"><span>Overview</span><span>1</span></button>
+          <button class="navbutton" data-view="catalog"><span>Catalog</span><span>3</span></button>
+          <button class="navbutton" data-view="planner"><span>Planner</span><span>5</span></button>
+          <button class="navbutton" data-view="reports"><span>Reports</span><span>2</span></button>
+          <button class="navbutton" data-view="diagnostics"><span>Diagnostics</span><span>4</span></button>
+        </nav>
+
+        <div class="content">
+          <section data-panel="overview">
+            <div class="section-head">
+              <div>
+                <h2>System Summary</h2>
+                <p class="muted">Static preview wired to the current safe CLI model.</p>
+              </div>
+              <span class="risk">Safe scaffold</span>
+            </div>
+            <div class="grid">
+              <div class="panel">
+                <h3>Host Adapter</h3>
+                <p class="muted">`host-safe` inspection only</p>
+                <p>Real boot adapters disabled by default.</p>
+              </div>
+              <div class="panel">
+                <h3>Fake Scenarios</h3>
+                <p>Windows BitLocker, Linux LUKS low-space, macOS Apple Silicon.</p>
+              </div>
+              <div class="panel">
+                <h3>Local State</h3>
+                <p>Reports in `.nousb/reports`; bundles in `.nousb/diagnostics`.</p>
+              </div>
+            </div>
+          </section>
+
+          <section data-panel="catalog" hidden>
+            <div class="section-head">
+              <div>
+                <h2>Installer Catalog</h2>
+                <p class="muted">Versioned TOML profiles embedded in the workspace.</p>
+              </div>
+              <button class="copy" data-copy="cargo run -p nousb -- catalog validate">Copy validate</button>
+            </div>
+            <table>
+              <thead>
+                <tr><th>Profile</th><th>Vendor</th><th>Strategies</th><th>Free Space</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>ubuntu-24.04-desktop</td><td>Canonical</td><td>ISO loopback, kernel/initrd</td><td>8 GB</td></tr>
+                <tr><td>fedora-42-workstation</td><td>Fedora Project</td><td>ISO loopback</td><td>8 GB</td></tr>
+                <tr><td>windows-11</td><td>Microsoft</td><td>Mounted ISO setup</td><td>16 GB</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section data-panel="planner" hidden>
+            <div class="section-head">
+              <div>
+                <h2>Plan Preview</h2>
+                <p class="muted">Fake Linux low-space boot-once plan for Ubuntu.</p>
+              </div>
+              <span class="risk high">High</span>
+            </div>
+            <ul class="steps">
+              <li><strong>boot</strong><span>Prefer one-time boot, keep the current OS default, and disallow permanent boot-order changes.</span></li>
+              <li><strong>info</strong><span>Inspect current firmware, encryption, disk, and boot metadata.</span></li>
+              <li><strong>low</strong><span>Create a project-local recovery pack.</span></li>
+              <li><strong>medium</strong><span>Verify installer checksum before any execution path.</span></li>
+              <li><strong>medium</strong><span>Preview staging without boot changes.</span></li>
+              <li><strong>high</strong><span>Resolve low disk space before proceeding.</span></li>
+            </ul>
+          </section>
+
+          <section data-panel="reports" hidden>
+            <div class="section-head">
+              <div>
+                <h2>Execution Reports</h2>
+                <p class="muted">Simulation reports survive across sessions as JSON.</p>
+              </div>
+              <button class="copy" data-copy="cargo run -p nousb -- reports list">Copy list</button>
+            </div>
+            <div class="grid">
+              <div class="panel">
+                <h3>Interrupted</h3>
+                <p>Recovery required, pending steps preserved.</p>
+              </div>
+              <div class="panel">
+                <h3>Rolled Back</h3>
+                <p>Rollback-capable completed steps marked.</p>
+              </div>
+              <div class="panel">
+                <h3>Failed</h3>
+                <p>Named step failure can be rehearsed with `--fail-step`.</p>
+              </div>
+            </div>
+          </section>
+
+          <section data-panel="diagnostics" hidden>
+            <div class="section-head">
+              <div>
+                <h2>Diagnostics</h2>
+                <p class="muted">Project-local bundle export with secret-like line redaction.</p>
+              </div>
+              <button class="copy" data-copy="cargo run -p nousb -- diagnostics export">Copy export</button>
+            </div>
+            <div class="commands">
+              <div class="command-row"><pre>cargo run -p nousb -- system inspect-fake windows-bitlocker</pre><button class="copy" data-copy="cargo run -p nousb -- system inspect-fake windows-bitlocker">Copy</button></div>
+              <div class="command-row"><pre>cargo run -p nousb -- plan-fake linux-luks-low-space boot-once ubuntu-24.04-desktop</pre><button class="copy" data-copy="cargo run -p nousb -- plan-fake linux-luks-low-space boot-once ubuntu-24.04-desktop">Copy</button></div>
+              <div class="command-row"><pre>cargo run -p nousb -- --interrupt-after 2 simulate boot-once ubuntu-24.04-desktop</pre><button class="copy" data-copy="cargo run -p nousb -- --interrupt-after 2 simulate boot-once ubuntu-24.04-desktop">Copy</button></div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <script>
+      const buttons = [...document.querySelectorAll(".navbutton")];
+      const panels = [...document.querySelectorAll("[data-panel]")];
+      buttons.forEach((button) => {
+        button.addEventListener("click", () => {
+          const view = button.dataset.view;
+          buttons.forEach((item) => item.setAttribute("aria-selected", String(item === button)));
+          panels.forEach((panel) => {
+            panel.hidden = panel.dataset.panel !== view;
+          });
+        });
+      });
+
+      document.querySelectorAll("[data-copy]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          await navigator.clipboard?.writeText(button.dataset.copy);
+          button.textContent = "Copied";
+          setTimeout(() => (button.textContent = "Copy"), 900);
+        });
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,75 @@
+{
+  "generated_by": "nousb dashboard export",
+  "safe_default_build": true,
+  "catalog": [
+    {
+      "id": "ubuntu-24.04-desktop",
+      "name": "Ubuntu Desktop",
+      "vendor": "Canonical",
+      "version": "24.04 LTS",
+      "required_free_space_gb": 8,
+      "supported_staging_strategies": ["iso_loopback", "kernel_initrd"]
+    },
+    {
+      "id": "fedora-42-workstation",
+      "name": "Fedora Workstation",
+      "vendor": "Fedora Project",
+      "version": "42",
+      "required_free_space_gb": 8,
+      "supported_staging_strategies": ["iso_loopback"]
+    },
+    {
+      "id": "windows-11",
+      "name": "Windows 11",
+      "vendor": "Microsoft",
+      "version": "current",
+      "required_free_space_gb": 16,
+      "supported_staging_strategies": ["windows_mounted_iso_setup"]
+    }
+  ],
+  "fake_scenarios": [
+    {
+      "id": "windows-bitlocker",
+      "adapter": "fake-windows-uefi-bitlocker",
+      "risk_notes": ["BitLocker recovery key backup must be confirmed before boot changes.", "Secure Boot is enabled."]
+    },
+    {
+      "id": "linux-luks-low-space",
+      "adapter": "fake-linux-grub-luks-btrfs-low-space",
+      "risk_notes": ["LUKS header backup should be completed manually.", "Only 3 GB free for an 8 GB profile."]
+    },
+    {
+      "id": "macos-apple-silicon",
+      "adapter": "fake-macos-apple-silicon-filevault",
+      "risk_notes": ["Apple Silicon boot policy must not be bypassed.", "FileVault is enabled."]
+    }
+  ],
+  "sample_plan": {
+    "kind": "boot-once",
+    "profile_id": "ubuntu-24.04-desktop",
+    "scenario": "linux-luks-low-space",
+    "risk": "high",
+    "boot_plan": {
+      "selected_preference": "one_time_boot",
+      "keep_current_os_default": true,
+      "allow_permanent_boot_order_change": false,
+      "fallback_description": "If staged boot fails, return to the existing OS path."
+    },
+    "steps": [
+      "inspect-system",
+      "create-recovery-pack",
+      "verify-installer",
+      "stage-installer-dry-run",
+      "resolve-low-disk-space"
+    ]
+  },
+  "commands": [
+    "cargo run -p nousb -- catalog validate",
+    "cargo run -p nousb -- system inspect-fake windows-bitlocker",
+    "cargo run -p nousb -- plan-fake linux-luks-low-space boot-once ubuntu-24.04-desktop",
+    "cargo run -p nousb -- --interrupt-after 2 simulate boot-once ubuntu-24.04-desktop",
+    "cargo run -p nousb -- reports list",
+    "cargo run -p nousb -- diagnostics export",
+    "cargo run -p nousb -- dashboard export"
+  ]
+}

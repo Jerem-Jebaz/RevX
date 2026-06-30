@@ -1,0 +1,12 @@
+[package]
+name = "nousb-platform-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nousb-core = { path = "../nousb-core" }
+
+[features]
+default = []
+real-macos-boot = []

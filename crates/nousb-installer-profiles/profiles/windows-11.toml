@@ -1,0 +1,22 @@
+schema_version = "1"
+id = "windows-11"
+name = "Windows 11"
+vendor = "Microsoft"
+version = "current"
+architecture = "x86_64"
+source_url = "https://www.microsoft.com/software-download/windows11"
+checksum_url = "https://www.microsoft.com/software-download/windows11"
+sha256 = "verify-against-microsoft-release-metadata"
+signature_url = ""
+homepage = "https://www.microsoft.com/windows"
+license_notes = "Use Microsoft's official installer, activation, and license terms."
+supported_platforms = ["windows_uefi"]
+supported_staging_strategies = ["windows_mounted_iso_setup"]
+required_free_space_gb = 16
+extraction_rules = ["use_official_mounted_iso_setup_flow", "do_not_modify_windows_installer_payload"]
+kernel_initrd_paths = []
+bootloader_paths = []
+secure_boot_notes = "Use Microsoft-supported installer flows only."
+known_limitations = ["Linux/macOS hosts show guidance only in default build.", "Default build does not launch setup.exe."]
+post_boot_instructions = "Use the official Windows setup flow for reinstall or upgrade."
+

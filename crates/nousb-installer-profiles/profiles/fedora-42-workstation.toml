@@ -1,0 +1,22 @@
+schema_version = "1"
+id = "fedora-42-workstation"
+name = "Fedora Workstation"
+vendor = "Fedora Project"
+version = "42"
+architecture = "x86_64"
+source_url = "https://fedoraproject.org/workstation/download"
+checksum_url = "https://fedoraproject.org/security"
+sha256 = "catalog-metadata-required-before-download"
+signature_url = "https://fedoraproject.org/security"
+homepage = "https://fedoraproject.org"
+license_notes = "Use Fedora's official download and licensing information."
+supported_platforms = ["windows_uefi", "linux_uefi"]
+supported_staging_strategies = ["iso_loopback"]
+required_free_space_gb = 8
+extraction_rules = ["preserve_official_iso_contents", "do_not_modify_signed_boot_assets"]
+kernel_initrd_paths = []
+bootloader_paths = ["/EFI/BOOT/BOOTX64.EFI"]
+secure_boot_notes = "Use official Fedora media and signature verification where available."
+known_limitations = ["Default build only creates dry-run plans.", "Profile requires release-specific checksum metadata before execution."]
+post_boot_instructions = "Use the official Fedora installer to boot live media or install."
+

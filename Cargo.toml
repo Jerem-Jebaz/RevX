@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/nousb-core",
+    "crates/nousb-cli",
+    "crates/nousb-platform-windows",
+    "crates/nousb-platform-linux",
+    "crates/nousb-platform-macos",
+    "crates/nousb-installer-profiles",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+version = "0.1.0"
+authors = ["NoUSB OS Switcher contributors"]
+

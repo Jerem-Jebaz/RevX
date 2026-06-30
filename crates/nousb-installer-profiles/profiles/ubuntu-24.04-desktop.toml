@@ -1,0 +1,22 @@
+schema_version = "1"
+id = "ubuntu-24.04-desktop"
+name = "Ubuntu Desktop"
+vendor = "Canonical"
+version = "24.04 LTS"
+architecture = "x86_64"
+source_url = "https://ubuntu.com/download/desktop"
+checksum_url = "https://releases.ubuntu.com/24.04/SHA256SUMS"
+sha256 = "catalog-metadata-required-before-download"
+signature_url = "https://releases.ubuntu.com/24.04/SHA256SUMS.gpg"
+homepage = "https://ubuntu.com"
+license_notes = "Use Canonical's official download and license terms."
+supported_platforms = ["windows_uefi", "linux_uefi"]
+supported_staging_strategies = ["iso_loopback", "kernel_initrd"]
+required_free_space_gb = 8
+extraction_rules = ["preserve_official_iso_contents", "do_not_modify_signed_boot_assets"]
+kernel_initrd_paths = ["/casper/vmlinuz", "/casper/initrd"]
+bootloader_paths = ["/EFI/BOOT/BOOTX64.EFI", "/EFI/BOOT/grubx64.efi"]
+secure_boot_notes = "Use official signed Ubuntu boot assets. Stop if firmware rejects them."
+known_limitations = ["Default build only creates dry-run plans.", "Checksum placeholder must be replaced by release-specific metadata before execution."]
+post_boot_instructions = "Use the official Ubuntu installer to try, install alongside, or replace the current OS."
+

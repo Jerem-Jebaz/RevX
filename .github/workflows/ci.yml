@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all --check
+      - run: cargo test --workspace
+      - run: cargo run -p nousb -- catalog validate
+      - run: cargo run -p nousb -- system inspect-fake windows-bitlocker
+      - run: cargo run -p nousb -- plan-fake linux-luks-low-space boot-once ubuntu-24.04-desktop
+      - run: cargo run -p nousb -- --interrupt-after 2 simulate boot-once ubuntu-24.04-desktop
+      - run: cargo run -p nousb -- reports list
+      - run: cargo run -p nousb -- diagnostics export
+      - run: cargo run -p nousb -- dashboard export
