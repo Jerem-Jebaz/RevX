@@ -653,10 +653,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", plan.preview());
                 println!("Starting only after exact typed confirmation was supplied.");
             }
-            let report = nousb_platform_windows::run_windows_qemu_current_os_rehearsal(
-                &cwd,
-                confirmation,
-            )?;
+            let report =
+                nousb_platform_windows::run_windows_qemu_current_os_rehearsal(&cwd, confirmation)?;
             write_journal_entry(
                 &cwd,
                 &format!(
@@ -673,10 +671,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("report: {}", report.report_path.display());
                 println!("first_boot_observed: {}", report.first_boot_observed);
                 println!("second_boot_observed: {}", report.second_boot_observed);
-                println!(
-                    "same_guest_disk_reused: {}",
-                    report.same_guest_disk_reused
-                );
+                println!("same_guest_disk_reused: {}", report.same_guest_disk_reused);
                 println!(
                     "same_uefi_variable_store_reused: {}",
                     report.same_uefi_variable_store_reused

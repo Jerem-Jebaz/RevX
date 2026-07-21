@@ -1272,7 +1272,10 @@ fn create_disposable_current_os_root(
     )?;
     write_create_new(&rootfs.join("etc/group"), b"root:x:0:\ntty:x:5:\n")?;
     write_create_new(&rootfs.join("etc/shadow"), b"root:*:0:0:99999:7:::\n")?;
-    write_create_new(&rootfs.join("etc/fstab"), b"proc /proc proc defaults 0 0\nsysfs /sys sysfs defaults 0 0\n")?;
+    write_create_new(
+        &rootfs.join("etc/fstab"),
+        b"proc /proc proc defaults 0 0\nsysfs /sys sysfs defaults 0 0\n",
+    )?;
     write_create_new(
         &rootfs.join("etc/inittab"),
         b"::sysinit:/etc/init.d/rcS\nttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100\n::ctrlaltdel:/sbin/reboot\n::shutdown:/bin/umount -a -r\n",
@@ -1408,8 +1411,7 @@ fn run_disposable_current_os_boot_once(
         "-device".to_string(),
         "qemu-xhci,id=currentxhci".to_string(),
         "-device".to_string(),
-        "usb-storage,drive=currentbootfat,id=currentbootusb,removable=true,bootindex=0"
-            .to_string(),
+        "usb-storage,drive=currentbootfat,id=currentbootusb,removable=true,bootindex=0".to_string(),
         "-qmp".to_string(),
         "stdio".to_string(),
     ];
