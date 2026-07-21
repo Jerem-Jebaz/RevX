@@ -20,7 +20,16 @@ Keep default builds non-destructive. Do not add real boot, disk, partition, encr
 ```sh
 cargo test --workspace
 cargo run -p nousb -- doctor
+cargo run -p nousb -- tui
 cargo run -p nousb -- catalog validate
+cargo run -p nousb -- --json image manifest ubuntu-24.04-desktop
+cargo run -p nousb -- vm doctor
+cargo run -p nousb -- vm rehearse uefi-bootnext ubuntu-24.04-desktop
+cargo run -p nousb -- vm qemu plan-smoke
+cargo run -p nousb -- vm qemu plan-ubuntu-netboot
+cargo run -p nousb -- vm qemu plan-ubuntu-full-ram
+cargo run -p nousb -- vm qemu plan-ubuntu-uefi-full-ram
+cargo run -p nousb -- workflow assess-fake windows-bitlocker ubuntu-24.04-desktop
 cargo run -p nousb -- --json plan boot-once ubuntu-24.04-desktop
 cargo run -p nousb -- dashboard export
 ```
@@ -31,11 +40,12 @@ Use the `Next Best Steps` section in `TODO.md` as the active project queue.
 
 Current highest-value next tasks:
 
-1. Replace hand-written JSON and CLI parsing with `serde` and `clap` when dependency access is available.
-2. Replace the SQLite shell-out with a Rust SQLite crate such as `rusqlite`.
-3. Move persisted report storage into the SQLite journal schema.
-4. Add resume/recover commands that consume persisted reports.
-5. Wire the React/Tauri app to load `dashboard export` data through a Tauri command.
+1. Add a disposable current-OS guest disk and prove a real one-shot return/fallback after the now-proven UEFI full-ISO RAM boot.
+2. Inject interruptions through that disposable-guest path and prove the complete recovery matrix.
+3. Add Secure Boot coverage and replace the isolated guest HTTP handoff with a pinned TLS-capable recovery transport.
+4. Extend read-only inspection with ESP, boot-manager, and network-boot hints.
+5. Add signature-chain verification in addition to pinned SHA-256.
+6. Wire the guided TUI workflow and live evidence into the React/Tauri command bridge.
 
 ## Fresh Chat Prompt
 

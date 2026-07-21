@@ -6,4 +6,6 @@ license.workspace = true
 
 [dependencies]
 nousb-core = { path = "../nousb-core" }
+nousb-platform-linux = { path = "../nousb-platform-linux" }
+nousb-platform-windows = { path = "../nousb-platform-windows" }
 

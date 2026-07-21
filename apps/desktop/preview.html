@@ -280,10 +280,12 @@
       <div class="layout">
         <nav aria-label="Views">
           <button class="navbutton" data-view="overview" aria-selected="true"><span>Overview</span><span>1</span></button>
-          <button class="navbutton" data-view="catalog"><span>Catalog</span><span>3</span></button>
+          <button class="navbutton" data-view="delivery"><span>Delivery</span><span>2</span></button>
+          <button class="navbutton" data-view="vm"><span>VM Evidence</span><span>3</span></button>
+          <button class="navbutton" data-view="catalog"><span>Catalog</span><span>4</span></button>
           <button class="navbutton" data-view="planner"><span>Planner</span><span>5</span></button>
-          <button class="navbutton" data-view="reports"><span>Reports</span><span>2</span></button>
-          <button class="navbutton" data-view="diagnostics"><span>Diagnostics</span><span>4</span></button>
+          <button class="navbutton" data-view="reports"><span>Reports</span><span>6</span></button>
+          <button class="navbutton" data-view="diagnostics"><span>Diagnostics</span><span>7</span></button>
         </nav>
 
         <div class="content">
@@ -297,17 +299,17 @@
             </div>
             <div class="grid">
               <div class="panel">
-                <h3>Host Adapter</h3>
-                <p class="muted">`host-safe` inspection only</p>
-                <p>Real boot adapters disabled by default.</p>
+                <h3>Guided TUI</h3>
+                <p class="muted">Run `cargo run -p nousb -- tui`</p>
+                <p>Inspect, assess, acquire, verify, stage, and preview plans without a boot executor.</p>
               </div>
               <div class="panel">
                 <h3>Fake Scenarios</h3>
-                <p>Windows BitLocker, Linux LUKS low-space, macOS Apple Silicon.</p>
+                <p>Windows BitLocker and Linux LUKS low-space. macOS is outside the current objective.</p>
               </div>
               <div class="panel">
                 <h3>Local State</h3>
-                <p>Reports in `.nousb/reports`; bundles in `.nousb/diagnostics`.</p>
+                <p>Verified images, staging bundles, reports, diagnostics, QEMU runtime, and disposable VM evidence stay project-local.</p>
               </div>
             </div>
           </section>
@@ -322,14 +324,48 @@
             </div>
             <table>
               <thead>
-                <tr><th>Profile</th><th>Vendor</th><th>Strategies</th><th>Free Space</th></tr>
+                <tr><th>Profile</th><th>Vendor</th><th>Strategies</th><th>Artifact</th></tr>
               </thead>
               <tbody>
-                <tr><td>ubuntu-24.04-desktop</td><td>Canonical</td><td>ISO loopback, kernel/initrd</td><td>8 GB</td></tr>
-                <tr><td>fedora-42-workstation</td><td>Fedora Project</td><td>ISO loopback</td><td>8 GB</td></tr>
-                <tr><td>windows-11</td><td>Microsoft</td><td>Mounted ISO setup</td><td>16 GB</td></tr>
+                <tr><td>ubuntu-24.04-desktop</td><td>Canonical</td><td>ISO loopback, kernel/initrd</td><td>Pinned 24.04.4</td></tr>
+                <tr><td>ubuntu-24.04-server</td><td>Canonical</td><td>UEFI FAT, network-to-RAM</td><td>Pinned 24.04.4</td></tr>
+                <tr><td>fedora-44-workstation</td><td>Fedora Project</td><td>ISO loopback</td><td>Pinned 44</td></tr>
+                <tr><td>windows-11</td><td>Microsoft</td><td>Mounted ISO setup</td><td>Vendor-mediated</td></tr>
               </tbody>
             </table>
+          </section>
+
+          <section data-panel="delivery" hidden>
+            <div class="section-head">
+              <div>
+                <h2>No-USB Delivery</h2>
+                <p class="muted">Feasibility is checked before a boot plan is created.</p>
+              </div>
+              <button class="copy" data-copy="cargo run -p nousb -- workflow assess-fake windows-bitlocker ubuntu-24.04-desktop">Copy assessment</button>
+            </div>
+            <div class="grid">
+              <div class="panel"><h3>Host-staged RAM boot</h3><p>The pinned official ISO and non-executable asset bundle now work. Initial signed assets persist on disk; live media moves into RAM only after boot.</p></div>
+              <div class="panel"><h3>UEFI HTTP Boot</h3><p>Needs firmware and preboot network support. UEFI alone is not enough, and Wi-Fi support varies by model.</p></div>
+              <div class="panel"><h3>Dell BIOSConnect</h3><p>Useful reference architecture, but vendor firmware cannot be generalized by this app or used for arbitrary OS images.</p></div>
+              <div class="panel"><h3>Recovery rehearsal</h3><p>Four backend models pass simulated interruptions; real QEMU now proves a pinned full Ubuntu Server ISO continues from RAM after its EFI and HTTP sources are removed.</p></div>
+              <div class="panel"><h3>Current boundary</h3><p>Secure Boot, guest-side HTTPS, a real current-OS fallback boot, power-loss recovery, and host boot adapters remain unproven.</p></div>
+            </div>
+          </section>
+
+          <section data-panel="vm" hidden>
+            <div class="section-head">
+              <div>
+                <h2>Disposable VM Evidence</h2>
+                <p class="muted">Real QEMU evidence remains separate from host boot execution.</p>
+              </div>
+              <button class="copy" data-copy="cargo run -p nousb -- vm qemu plan-ubuntu-uefi-full-ram">Copy combined plan</button>
+            </div>
+            <div class="grid">
+              <div class="panel"><h3>UEFI + official assets: proven</h3><p>OVMF selected the run-local FAT source; pinned BOOTX64.EFI, GRUB, and MOK manager hashes matched the official Ubuntu 24.04.4 Server ISO.</p></div>
+              <div class="panel"><h3>Full installer RAM: proven</h3><p>The complete 3,405,469,696-byte ISO was saved in initramfs, Subiquity mounted, and the installer tty appeared after the HTTP source stopped.</p></div>
+              <div class="panel"><h3>Boot-source removal: proven</h3><p>QMP deleted the boot USB and vvfat node; the final block list contained only immutable OVMF code and a disposable variables copy.</p></div>
+              <div class="panel"><h3>Remaining gates</h3><p>Secure Boot is off, the guest handoff is isolated HTTP rather than HTTPS, and a real one-shot fallback/current-OS reboot is still unproven.</p></div>
+            </div>
           </section>
 
           <section data-panel="planner" hidden>
@@ -354,7 +390,7 @@
             <div class="section-head">
               <div>
                 <h2>Execution Reports</h2>
-                <p class="muted">Simulation reports survive across sessions as JSON.</p>
+                <p class="muted">Simulation and disposable real-VM evidence survive as project-local JSON.</p>
               </div>
               <button class="copy" data-copy="cargo run -p nousb -- reports list">Copy list</button>
             </div>
@@ -383,6 +419,8 @@
               <button class="copy" data-copy="cargo run -p nousb -- diagnostics export">Copy export</button>
             </div>
             <div class="commands">
+              <div class="command-row"><pre>cargo run -p nousb -- vm qemu plan-ubuntu-uefi-full-ram</pre><button class="copy" data-copy="cargo run -p nousb -- vm qemu plan-ubuntu-uefi-full-ram">Copy</button></div>
+              <div class="command-row"><pre>cargo run -p nousb -- vm qemu rehearse-ubuntu-uefi-full-ram &quot;RUN DISPOSABLE UBUNTU UEFI FULL ISO RAM REHEARSAL&quot;</pre><button class="copy" data-copy="cargo run -p nousb -- vm qemu rehearse-ubuntu-uefi-full-ram &quot;RUN DISPOSABLE UBUNTU UEFI FULL ISO RAM REHEARSAL&quot;">Copy</button></div>
               <div class="command-row"><pre>cargo run -p nousb -- system inspect-fake windows-bitlocker</pre><button class="copy" data-copy="cargo run -p nousb -- system inspect-fake windows-bitlocker">Copy</button></div>
               <div class="command-row"><pre>cargo run -p nousb -- plan-fake linux-luks-low-space boot-once ubuntu-24.04-desktop</pre><button class="copy" data-copy="cargo run -p nousb -- plan-fake linux-luks-low-space boot-once ubuntu-24.04-desktop">Copy</button></div>
               <div class="command-row"><pre>cargo run -p nousb -- --interrupt-after 2 simulate boot-once ubuntu-24.04-desktop</pre><button class="copy" data-copy="cargo run -p nousb -- --interrupt-after 2 simulate boot-once ubuntu-24.04-desktop">Copy</button></div>

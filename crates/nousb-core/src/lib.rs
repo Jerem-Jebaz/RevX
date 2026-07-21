@@ -1,8 +1,21 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use iso9660_simple::{ISODirectoryEntry, Read as IsoRead, ISO9660};
+use reqwest::blocking::{Client, Response};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, RANGE};
+use reqwest::redirect::Policy;
+use reqwest::StatusCode;
+use sha2::{Digest, Sha256};
+
+mod qemu;
+pub use qemu::{
+    acquire_qemu_windows_runtime, qemu_runtime_cache_path, qemu_windows_runtime_manifest,
+    QemuRuntimeDownload, QemuRuntimeManifest,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FirmwareMode {
@@ -52,6 +65,7 @@ pub struct BootEntry {
 pub struct SystemInventory {
     pub os_name: String,
     pub arch: String,
+    pub memory_total_mb: Option<u64>,
     pub firmware: FirmwareMode,
     pub secure_boot: SecureBootState,
     pub encryption: EncryptionState,
@@ -82,6 +96,130 @@ pub enum PlatformCapability {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeliveryReadiness {
+    DesignCandidate,
+    RequiresHostCapability,
+    Unsupported,
+    OutOfScope,
+}
+
+impl DeliveryReadiness {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeliveryReadiness::DesignCandidate => "design_candidate",
+            DeliveryReadiness::RequiresHostCapability => "requires_host_capability",
+            DeliveryReadiness::Unsupported => "unsupported",
+            DeliveryReadiness::OutOfScope => "out_of_scope",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PayloadResidency {
+    FullLiveMediaInRam,
+    BootEnvironmentInRam,
+    PersistentStaging,
+    FirmwareManaged,
+}
+
+impl PayloadResidency {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PayloadResidency::FullLiveMediaInRam => "full_live_media_in_ram",
+            PayloadResidency::BootEnvironmentInRam => "boot_environment_in_ram",
+            PayloadResidency::PersistentStaging => "persistent_staging",
+            PayloadResidency::FirmwareManaged => "firmware_managed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryRoute {
+    pub id: String,
+    pub name: String,
+    pub readiness: DeliveryReadiness,
+    pub payload_residency: PayloadResidency,
+    pub requires_persistent_staging: bool,
+    pub requirements: Vec<String>,
+    pub limitations: Vec<String>,
+    pub reference_urls: Vec<String>,
+}
+
+impl DeliveryRoute {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{{},{},\"readiness\":\"{}\",\"payload_residency\":\"{}\",\"requires_persistent_staging\":{},\"requirements\":{},\"limitations\":{},\"reference_urls\":{}}}",
+            json_pair("id", &self.id),
+            json_pair("name", &self.name),
+            self.readiness.as_str(),
+            self.payload_residency.as_str(),
+            self.requires_persistent_staging,
+            json_string_array(&self.requirements),
+            json_string_array(&self.limitations),
+            json_string_array(&self.reference_urls)
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryAssessment {
+    pub host_os: String,
+    pub profile_id: String,
+    pub recommended_route: Option<String>,
+    pub safe_default_execution_enabled: bool,
+    pub universal_no_usb_guarantee: bool,
+    pub summary: String,
+    pub routes: Vec<DeliveryRoute>,
+}
+
+impl DeliveryAssessment {
+    pub fn preview(&self) -> String {
+        let mut output = format!(
+            "Delivery assessment\nHost: {}\nProfile: {}\nExecution enabled: {}\nUniversal no-USB guarantee: {}\n",
+            self.host_os,
+            self.profile_id,
+            self.safe_default_execution_enabled,
+            self.universal_no_usb_guarantee
+        );
+        match &self.recommended_route {
+            Some(route) => output.push_str(&format!("Recommended design route: {route}\n")),
+            None => {
+                output.push_str("Recommended design route: none until capability checks pass\n")
+            }
+        }
+        output.push_str(&format!("Summary: {}\nRoutes:\n", self.summary));
+        for route in &self.routes {
+            output.push_str(&format!(
+                "- {} [{}]: {}\n  payload: {}; persistent staging: {}\n",
+                route.id,
+                route.readiness.as_str(),
+                route.name,
+                route.payload_residency.as_str(),
+                route.requires_persistent_staging
+            ));
+            for limitation in &route.limitations {
+                output.push_str(&format!("  limitation: {limitation}\n"));
+            }
+        }
+        output
+    }
+
+    pub fn to_json(&self) -> String {
+        let routes: Vec<String> = self.routes.iter().map(DeliveryRoute::to_json).collect();
+        format!(
+            "{{{},{},\"recommended_route\":{},\"safe_default_execution_enabled\":{},\"universal_no_usb_guarantee\":{},{},\"routes\":[{}]}}",
+            json_pair("host_os", &self.host_os),
+            json_pair("profile_id", &self.profile_id),
+            json_optional_value(self.recommended_route.as_deref()),
+            self.safe_default_execution_enabled,
+            self.universal_no_usb_guarantee,
+            json_pair("summary", &self.summary),
+            routes.join(",")
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallerProfile {
     pub schema_version: String,
     pub id: String,
@@ -92,6 +230,8 @@ pub struct InstallerProfile {
     pub source_url: String,
     pub checksum_url: String,
     pub sha256: String,
+    pub artifact_filename: Option<String>,
+    pub artifact_size_bytes: Option<u64>,
     pub signature_url: Option<String>,
     pub homepage: String,
     pub license_notes: String,
@@ -104,6 +244,296 @@ pub struct InstallerProfile {
     pub secure_boot_notes: String,
     pub known_limitations: Vec<String>,
     pub post_boot_instructions: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactManifest {
+    pub profile_id: String,
+    pub filename: String,
+    pub source_url: String,
+    pub checksum_url: String,
+    pub signature_url: Option<String>,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+impl ArtifactManifest {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{{},{},{},{},\"signature_url\":{},{},\"size_bytes\":{}}}",
+            json_pair("profile_id", &self.profile_id),
+            json_pair("filename", &self.filename),
+            json_pair("source_url", &self.source_url),
+            json_pair("checksum_url", &self.checksum_url),
+            json_optional_value(self.signature_url.as_deref()),
+            json_pair("sha256", &self.sha256),
+            self.size_bytes
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactProbe {
+    pub manifest: ArtifactManifest,
+    pub final_url: String,
+    pub content_length: Option<u64>,
+    pub accepts_ranges: bool,
+}
+
+impl ArtifactProbe {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"manifest\":{}, {},\"content_length\":{},\"accepts_ranges\":{}}}",
+            self.manifest.to_json(),
+            json_pair("final_url", &self.final_url),
+            self.content_length
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".into()),
+            self.accepts_ranges
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactDownload {
+    pub manifest: ArtifactManifest,
+    pub path: PathBuf,
+    pub resumed_from_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub verified: bool,
+    pub already_present: bool,
+}
+
+impl ArtifactDownload {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"manifest\":{},{},\"resumed_from_bytes\":{},\"downloaded_bytes\":{},\"verified\":{},\"already_present\":{}}}",
+            self.manifest.to_json(),
+            json_pair("path", &self.path.display().to_string()),
+            self.resumed_from_bytes,
+            self.downloaded_bytes,
+            self.verified,
+            self.already_present
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagingAsset {
+    pub source_path: String,
+    pub size_bytes: u64,
+    pub output_path: Option<PathBuf>,
+    pub sha256: Option<String>,
+}
+
+impl StagingAsset {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{{},\"size_bytes\":{},\"output_path\":{},\"sha256\":{}}}",
+            json_pair("source_path", &self.source_path),
+            self.size_bytes,
+            json_optional_value(
+                self.output_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .as_deref()
+            ),
+            json_optional_value(self.sha256.as_deref())
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagingPreview {
+    pub profile_id: String,
+    pub artifact_path: PathBuf,
+    pub artifact_verified: bool,
+    pub assets: Vec<StagingAsset>,
+    pub execution_enabled: bool,
+}
+
+impl StagingPreview {
+    pub fn to_json(&self) -> String {
+        let assets: Vec<String> = self.assets.iter().map(StagingAsset::to_json).collect();
+        format!(
+            "{{{},{},\"artifact_verified\":{},\"assets\":[{}],\"execution_enabled\":{}}}",
+            json_pair("profile_id", &self.profile_id),
+            json_pair("artifact_path", &self.artifact_path.display().to_string()),
+            self.artifact_verified,
+            assets.join(","),
+            self.execution_enabled
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagingBundle {
+    pub profile_id: String,
+    pub path: PathBuf,
+    pub artifact_path: PathBuf,
+    pub artifact_sha256: String,
+    pub assets: Vec<StagingAsset>,
+    pub execution_enabled: bool,
+}
+
+impl StagingBundle {
+    pub fn to_json(&self) -> String {
+        let assets: Vec<String> = self.assets.iter().map(StagingAsset::to_json).collect();
+        format!(
+            "{{{},{},{},{},\"assets\":[{}],\"execution_enabled\":{}}}",
+            json_pair("profile_id", &self.profile_id),
+            json_pair("path", &self.path.display().to_string()),
+            json_pair("artifact_path", &self.artifact_path.display().to_string()),
+            json_pair("artifact_sha256", &self.artifact_sha256),
+            assets.join(","),
+            self.execution_enabled
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OneShotBootBackend {
+    UefiBootNext,
+    WindowsBcdBootSequence,
+    LinuxSystemdBootOneShot,
+    LinuxGrubReboot,
+}
+
+impl OneShotBootBackend {
+    pub fn id(&self) -> &'static str {
+        match self {
+            Self::UefiBootNext => "uefi-bootnext",
+            Self::WindowsBcdBootSequence => "windows-bcd-bootsequence",
+            Self::LinuxSystemdBootOneShot => "linux-systemd-boot-oneshot",
+            Self::LinuxGrubReboot => "linux-grub-reboot",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, NoUsbError> {
+        match value {
+            "uefi-bootnext" => Ok(Self::UefiBootNext),
+            "windows-bcd-bootsequence" => Ok(Self::WindowsBcdBootSequence),
+            "linux-systemd-boot-oneshot" => Ok(Self::LinuxSystemdBootOneShot),
+            "linux-grub-reboot" => Ok(Self::LinuxGrubReboot),
+            _ => Err(NoUsbError::InvalidInput(format!(
+                "unknown one-shot backend {value}; expected uefi-bootnext, windows-bcd-bootsequence, linux-systemd-boot-oneshot, or linux-grub-reboot"
+            ))),
+        }
+    }
+
+    fn reference_url(&self) -> &'static str {
+        match self {
+            Self::UefiBootNext => "https://uefi.org/specs/UEFI/2.11/03_Boot_Manager.html",
+            Self::WindowsBcdBootSequence => {
+                "https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/bcdedit--bootsequence"
+            }
+            Self::LinuxSystemdBootOneShot => {
+                "https://www.freedesktop.org/software/systemd/man/latest/bootctl.html"
+            }
+            Self::LinuxGrubReboot => "https://www.gnu.org/software/grub/manual/grub/grub.html",
+        }
+    }
+}
+
+impl fmt::Display for OneShotBootBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmRehearsalScenario {
+    pub id: String,
+    pub failure_after: Option<String>,
+    pub events: Vec<String>,
+    pub recovered: bool,
+    pub original_default_preserved: bool,
+    pub boot_order_preserved: bool,
+    pub one_shot_cleared: bool,
+    pub temporary_entry_removed: bool,
+    pub staged_assets_removed: bool,
+    pub installer_attempted: bool,
+    pub ram_payload_observed: bool,
+    pub fallback_observed: bool,
+    pub invariants_hold: bool,
+}
+
+impl VmRehearsalScenario {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{{},\"failure_after\":{},\"events\":{},\"recovered\":{},\"original_default_preserved\":{},\"boot_order_preserved\":{},\"one_shot_cleared\":{},\"temporary_entry_removed\":{},\"staged_assets_removed\":{},\"installer_attempted\":{},\"ram_payload_observed\":{},\"fallback_observed\":{},\"invariants_hold\":{}}}",
+            json_pair("id", &self.id),
+            json_optional_value(self.failure_after.as_deref()),
+            json_string_array(&self.events),
+            self.recovered,
+            self.original_default_preserved,
+            self.boot_order_preserved,
+            self.one_shot_cleared,
+            self.temporary_entry_removed,
+            self.staged_assets_removed,
+            self.installer_attempted,
+            self.ram_payload_observed,
+            self.fallback_observed,
+            self.invariants_hold
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmRehearsalReport {
+    pub id: String,
+    pub backend: OneShotBootBackend,
+    pub profile_id: String,
+    pub scenarios: Vec<VmRehearsalScenario>,
+    pub all_invariants_hold: bool,
+    pub real_vm_executed: bool,
+    pub host_boot_changes: bool,
+    pub reference_urls: Vec<String>,
+}
+
+impl VmRehearsalReport {
+    pub fn to_json(&self) -> String {
+        let scenarios = self
+            .scenarios
+            .iter()
+            .map(VmRehearsalScenario::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{{},{},{},\"scenarios\":[{}],\"all_invariants_hold\":{},\"real_vm_executed\":{},\"host_boot_changes\":{},\"reference_urls\":{}}}",
+            json_pair("id", &self.id),
+            json_pair("backend", self.backend.id()),
+            json_pair("profile_id", &self.profile_id),
+            scenarios,
+            self.all_invariants_hold,
+            self.real_vm_executed,
+            self.host_boot_changes,
+            json_string_array(&self.reference_urls)
+        )
+    }
+
+    pub fn preview(&self) -> String {
+        let mut output = String::new();
+        output.push_str("VM one-shot boot rehearsal\n");
+        output.push_str(&format!("Backend: {}\n", self.backend));
+        output.push_str(&format!("Profile: {}\n", self.profile_id));
+        output.push_str(&format!("Scenarios: {}\n", self.scenarios.len()));
+        output.push_str(&format!(
+            "All recovery invariants hold: {}\n",
+            self.all_invariants_hold
+        ));
+        output.push_str("Real VM executed: false\nHost boot changes: false\n");
+        for scenario in &self.scenarios {
+            output.push_str(&format!(
+                "- {}: invariants={} fallback={} ram={}\n",
+                scenario.id,
+                scenario.invariants_hold,
+                scenario.fallback_observed,
+                scenario.ram_payload_observed
+            ));
+        }
+        output
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -447,7 +877,7 @@ impl InstallerProfile {
             .map(|strategy| strategy.as_str().to_string())
             .collect();
         format!(
-            "{{{},{},{},{},{},{},{},{},{},\"signature_url\":{}, {},{},\"supported_platforms\":{},\"supported_staging_strategies\":{},\"required_free_space_gb\":{},\"extraction_rules\":{},\"kernel_initrd_paths\":{},\"bootloader_paths\":{}, {},\"known_limitations\":{}, {}}}",
+            "{{{},{},{},{},{},{},{},{},{},\"artifact_filename\":{},\"artifact_size_bytes\":{},\"signature_url\":{}, {},{},\"supported_platforms\":{},\"supported_staging_strategies\":{},\"required_free_space_gb\":{},\"extraction_rules\":{},\"kernel_initrd_paths\":{},\"bootloader_paths\":{}, {},\"known_limitations\":{}, {}}}",
             json_pair("schema_version", &self.schema_version),
             json_pair("id", &self.id),
             json_pair("name", &self.name),
@@ -457,6 +887,10 @@ impl InstallerProfile {
             json_pair("source_url", &self.source_url),
             json_pair("checksum_url", &self.checksum_url),
             json_pair("sha256", &self.sha256),
+            json_optional_value(self.artifact_filename.as_deref()),
+            self.artifact_size_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".into()),
             json_optional_value(self.signature_url.as_deref()),
             json_pair("homepage", &self.homepage),
             json_pair("license_notes", &self.license_notes),
@@ -532,10 +966,13 @@ impl SystemInventory {
             })
             .collect();
         format!(
-            "{{{},{},{},{},{},{},\"disk_inventory\":{{\"disks\":{},\"available_space_gb\":{},\"partitions\":[{}]}},\"boot_entries\":[{}],\"warnings\":{}}}",
+            "{{{},{},{},\"memory_total_mb\":{},{},{},{},\"disk_inventory\":{{\"disks\":{},\"available_space_gb\":{},\"partitions\":[{}]}},\"boot_entries\":[{}],\"warnings\":{}}}",
             json_pair("adapter", adapter),
             json_pair("os_name", &self.os_name),
             json_pair("arch", &self.arch),
+            self.memory_total_mb
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".into()),
             json_pair("firmware", &format!("{:?}", self.firmware)),
             json_pair("secure_boot", &format!("{:?}", self.secure_boot)),
             json_pair("encryption", &format!("{:?}", self.encryption)),
@@ -1038,6 +1475,7 @@ impl FakePlatformAdapter {
             inventory: SystemInventory {
                 os_name: "windows".into(),
                 arch: "x86_64".into(),
+                memory_total_mb: Some(32 * 1024),
                 firmware: FirmwareMode::Uefi,
                 secure_boot: SecureBootState::Enabled,
                 encryption: EncryptionState::Enabled("BitLocker".into()),
@@ -1085,6 +1523,7 @@ impl FakePlatformAdapter {
             inventory: SystemInventory {
                 os_name: "linux".into(),
                 arch: "x86_64".into(),
+                memory_total_mb: Some(8 * 1024),
                 firmware: FirmwareMode::Uefi,
                 secure_boot: SecureBootState::Disabled,
                 encryption: EncryptionState::Enabled("LUKS".into()),
@@ -1133,6 +1572,7 @@ impl FakePlatformAdapter {
             inventory: SystemInventory {
                 os_name: "macos".into(),
                 arch: "aarch64".into(),
+                memory_total_mb: Some(16 * 1024),
                 firmware: FirmwareMode::Uefi,
                 secure_boot: SecureBootState::Enabled,
                 encryption: EncryptionState::Enabled("FileVault".into()),
@@ -1197,6 +1637,9 @@ pub fn execute_plan_safe(plan: &OperationPlan, yes: bool) -> Result<ExecutionOut
 #[derive(Debug)]
 pub enum NoUsbError {
     Io(String),
+    Network(String),
+    Verification(String),
+    ArtifactUnavailable(String),
     UnknownProfile(String),
     ProfileParse(String),
     UnsafeExecution(String),
@@ -1207,6 +1650,11 @@ impl fmt::Display for NoUsbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NoUsbError::Io(value) => write!(f, "I/O error: {value}"),
+            NoUsbError::Network(value) => write!(f, "network error: {value}"),
+            NoUsbError::Verification(value) => write!(f, "verification error: {value}"),
+            NoUsbError::ArtifactUnavailable(value) => {
+                write!(f, "artifact unavailable: {value}")
+            }
             NoUsbError::UnknownProfile(value) => write!(f, "unknown installer profile: {value}"),
             NoUsbError::ProfileParse(value) => write!(f, "profile parse error: {value}"),
             NoUsbError::UnsafeExecution(value) => write!(f, "unsafe execution blocked: {value}"),
@@ -1236,6 +1684,8 @@ pub fn built_in_profiles() -> Vec<InstallerProfile> {
             source_url: "about:blank".into(),
             checksum_url: "about:blank".into(),
             sha256: "unavailable".into(),
+            artifact_filename: None,
+            artifact_size_bytes: None,
             signature_url: None,
             homepage: "about:blank".into(),
             license_notes: "Catalog parsing failed.".into(),
@@ -1255,7 +1705,8 @@ pub fn built_in_profiles() -> Vec<InstallerProfile> {
 pub fn embedded_profiles() -> Result<Vec<InstallerProfile>, NoUsbError> {
     let sources = [
         include_str!("../../nousb-installer-profiles/profiles/ubuntu-24.04-desktop.toml"),
-        include_str!("../../nousb-installer-profiles/profiles/fedora-42-workstation.toml"),
+        include_str!("../../nousb-installer-profiles/profiles/ubuntu-24.04-server.toml"),
+        include_str!("../../nousb-installer-profiles/profiles/fedora-44-workstation.toml"),
         include_str!("../../nousb-installer-profiles/profiles/windows-11.toml"),
     ];
     sources
@@ -1266,6 +1717,15 @@ pub fn embedded_profiles() -> Result<Vec<InstallerProfile>, NoUsbError> {
 
 pub fn parse_installer_profile(source: &str) -> Result<InstallerProfile, NoUsbError> {
     let fields = ProfileFields::parse(source)?;
+    let artifact_size_bytes = fields
+        .optional("artifact_size_bytes")
+        .map(|value| {
+            value.parse::<u64>().map_err(|error| {
+                NoUsbError::ProfileParse(format!("artifact_size_bytes is invalid: {error}"))
+            })
+        })
+        .transpose()?
+        .filter(|value| *value > 0);
     let profile = InstallerProfile {
         schema_version: fields.required("schema_version")?,
         id: fields.required("id")?,
@@ -1276,6 +1736,8 @@ pub fn parse_installer_profile(source: &str) -> Result<InstallerProfile, NoUsbEr
         source_url: fields.required("source_url")?,
         checksum_url: fields.required("checksum_url")?,
         sha256: fields.required("sha256")?,
+        artifact_filename: fields.optional("artifact_filename"),
+        artifact_size_bytes,
         signature_url: fields.optional("signature_url"),
         homepage: fields.required("homepage")?,
         license_notes: fields.required("license_notes")?,
@@ -1341,6 +1803,840 @@ pub fn find_profile(id: &str) -> Result<InstallerProfile, NoUsbError> {
         .into_iter()
         .find(|profile| profile.id == id)
         .ok_or_else(|| NoUsbError::UnknownProfile(id.into()))
+}
+
+pub fn artifact_manifest(profile_id: &str) -> Result<ArtifactManifest, NoUsbError> {
+    let profile = find_profile(profile_id)?;
+    let filename = profile.artifact_filename.clone().ok_or_else(|| {
+        NoUsbError::ArtifactUnavailable(format!(
+            "{} has no stable vendor artifact URL; use {} to obtain vendor-mediated media",
+            profile.id, profile.source_url
+        ))
+    })?;
+    let size_bytes = profile.artifact_size_bytes.ok_or_else(|| {
+        NoUsbError::ArtifactUnavailable(format!("{} has no pinned artifact size", profile.id))
+    })?;
+    if !is_safe_filename(&filename) {
+        return Err(NoUsbError::ProfileParse(format!(
+            "{} has unsafe artifact filename {filename}",
+            profile.id
+        )));
+    }
+    if !is_https_url(&profile.source_url) || !is_https_url(&profile.checksum_url) {
+        return Err(NoUsbError::ProfileParse(format!(
+            "{} artifact and checksum URLs must use HTTPS",
+            profile.id
+        )));
+    }
+    if profile.sha256.len() != 64
+        || !profile
+            .sha256
+            .chars()
+            .all(|value| value.is_ascii_hexdigit())
+    {
+        return Err(NoUsbError::ArtifactUnavailable(format!(
+            "{} does not have a pinned SHA-256 digest",
+            profile.id
+        )));
+    }
+    if size_bytes == 0 {
+        return Err(NoUsbError::ArtifactUnavailable(format!(
+            "{} does not have a nonzero pinned artifact size",
+            profile.id
+        )));
+    }
+    Ok(ArtifactManifest {
+        profile_id: profile.id,
+        filename,
+        source_url: profile.source_url,
+        checksum_url: profile.checksum_url,
+        signature_url: profile.signature_url,
+        sha256: profile.sha256.to_ascii_lowercase(),
+        size_bytes,
+    })
+}
+
+pub fn artifact_cache_path(base_dir: &Path, profile_id: &str) -> Result<PathBuf, NoUsbError> {
+    let manifest = artifact_manifest(profile_id)?;
+    Ok(base_dir
+        .join(".nousb")
+        .join("artifacts")
+        .join(&manifest.profile_id)
+        .join(&manifest.filename))
+}
+
+pub fn probe_artifact(profile_id: &str) -> Result<ArtifactProbe, NoUsbError> {
+    let manifest = artifact_manifest(profile_id)?;
+    let response = http_client()?
+        .head(&manifest.source_url)
+        .send()
+        .map_err(|error| NoUsbError::Network(error.to_string()))?;
+    validate_https_response(&response)?;
+    if !response.status().is_success() {
+        return Err(NoUsbError::Network(format!(
+            "{} returned HTTP {}",
+            manifest.source_url,
+            response.status()
+        )));
+    }
+    let content_length = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(actual) = content_length {
+        if actual != manifest.size_bytes {
+            return Err(NoUsbError::Verification(format!(
+                "vendor reports {actual} bytes for {}, expected {}",
+                manifest.filename, manifest.size_bytes
+            )));
+        }
+    }
+    let accepts_ranges = response
+        .headers()
+        .get(ACCEPT_RANGES)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("bytes"));
+    Ok(ArtifactProbe {
+        final_url: response.url().to_string(),
+        manifest,
+        content_length,
+        accepts_ranges,
+    })
+}
+
+pub fn download_artifact(
+    base_dir: &Path,
+    profile_id: &str,
+) -> Result<ArtifactDownload, NoUsbError> {
+    let manifest = artifact_manifest(profile_id)?;
+    let artifact_dir = base_dir
+        .join(".nousb")
+        .join("artifacts")
+        .join(&manifest.profile_id);
+    fs::create_dir_all(&artifact_dir)?;
+    let final_path = artifact_dir.join(&manifest.filename);
+    if final_path.exists() {
+        let actual = sha256_file(&final_path)?;
+        if actual == manifest.sha256 {
+            return Ok(ArtifactDownload {
+                downloaded_bytes: manifest.size_bytes,
+                manifest,
+                path: final_path,
+                resumed_from_bytes: 0,
+                verified: true,
+                already_present: true,
+            });
+        }
+        return Err(NoUsbError::Verification(format!(
+            "cached artifact {} exists but has SHA-256 {actual}; it was not overwritten",
+            final_path.display()
+        )));
+    }
+
+    let lock_path = artifact_dir.join("download.lock");
+    let _lock = DownloadLock::acquire(lock_path)?;
+    let partial_path = artifact_dir.join(format!("{}.part", manifest.filename));
+    let resumed_from_bytes = fs::metadata(&partial_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if resumed_from_bytes > manifest.size_bytes {
+        return Err(NoUsbError::Verification(format!(
+            "partial download is {resumed_from_bytes} bytes, larger than expected {} bytes; move it aside and retry",
+            manifest.size_bytes
+        )));
+    }
+
+    if resumed_from_bytes == manifest.size_bytes {
+        return finalize_download(manifest, partial_path, final_path, resumed_from_bytes, 0);
+    }
+
+    let client = http_client()?;
+    let mut request = client.get(&manifest.source_url);
+    if resumed_from_bytes > 0 {
+        request = request.header(RANGE, format!("bytes={resumed_from_bytes}-"));
+    }
+    let mut response = request
+        .send()
+        .map_err(|error| NoUsbError::Network(error.to_string()))?;
+    validate_https_response(&response)?;
+    let expected_status = if resumed_from_bytes > 0 {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    if response.status() != expected_status {
+        return Err(NoUsbError::Network(format!(
+            "{} returned HTTP {}; expected {}. Existing partial data was kept unchanged",
+            manifest.source_url,
+            response.status(),
+            expected_status
+        )));
+    }
+
+    let expected_remaining = manifest.size_bytes - resumed_from_bytes;
+    if let Some(content_length) = response.content_length() {
+        if content_length != expected_remaining {
+            return Err(NoUsbError::Verification(format!(
+                "server offered {content_length} bytes, expected {expected_remaining} remaining bytes"
+            )));
+        }
+    }
+
+    let mut output = if resumed_from_bytes > 0 {
+        OpenOptions::new().append(true).open(&partial_path)?
+    } else {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&partial_path)?
+    };
+    let downloaded_bytes = io::copy(&mut response, &mut output)?;
+    output.sync_all()?;
+    finalize_download(
+        manifest,
+        partial_path,
+        final_path,
+        resumed_from_bytes,
+        downloaded_bytes,
+    )
+}
+
+pub fn inspect_staging_artifact(
+    profile_id: &str,
+    artifact_path: &Path,
+) -> Result<StagingPreview, NoUsbError> {
+    let manifest = artifact_manifest(profile_id)?;
+    verify_artifact_against_manifest(artifact_path, &manifest)?;
+    let profile = find_profile(profile_id)?;
+    inspect_staging_profile(&profile, artifact_path)
+}
+
+fn inspect_staging_profile(
+    profile: &InstallerProfile,
+    artifact_path: &Path,
+) -> Result<StagingPreview, NoUsbError> {
+    let mut iso = open_iso(artifact_path)?;
+    let mut declared_paths = profile.kernel_initrd_paths.clone();
+    declared_paths.extend(profile.bootloader_paths.clone());
+    if declared_paths.is_empty() {
+        return Err(NoUsbError::ArtifactUnavailable(format!(
+            "{} does not declare extractable staging assets",
+            profile.id
+        )));
+    }
+    let mut assets = Vec::new();
+    for source_path in declared_paths {
+        let entry = find_iso_entry(&mut iso, &source_path).ok_or_else(|| {
+            NoUsbError::Verification(format!(
+                "verified artifact does not contain declared path {source_path}"
+            ))
+        })?;
+        if !entry.is_file() {
+            return Err(NoUsbError::Verification(format!(
+                "declared staging path {source_path} is not a file"
+            )));
+        }
+        assets.push(StagingAsset {
+            source_path,
+            size_bytes: u64::from(entry.file_size()),
+            output_path: None,
+            sha256: None,
+        });
+    }
+    Ok(StagingPreview {
+        profile_id: profile.id.clone(),
+        artifact_path: artifact_path.to_path_buf(),
+        artifact_verified: true,
+        assets,
+        execution_enabled: false,
+    })
+}
+
+pub fn create_staging_bundle(
+    base_dir: &Path,
+    profile_id: &str,
+    artifact_path: &Path,
+) -> Result<StagingBundle, NoUsbError> {
+    let preview = inspect_staging_artifact(profile_id, artifact_path)?;
+    let manifest = artifact_manifest(profile_id)?;
+    create_staging_bundle_from_preview(base_dir, preview, &manifest.sha256)
+}
+
+fn create_staging_bundle_from_preview(
+    base_dir: &Path,
+    preview: StagingPreview,
+    artifact_sha256: &str,
+) -> Result<StagingBundle, NoUsbError> {
+    let profile_id = preview.profile_id.clone();
+    let artifact_path = preview.artifact_path.clone();
+    let bundle_name = format!(
+        "{}-{}-{}",
+        safe_filename(&profile_id),
+        now_stamp(),
+        std::process::id()
+    );
+    let staging_root = base_dir
+        .join(".nousb")
+        .join("staging")
+        .join(safe_filename(&profile_id));
+    fs::create_dir_all(&staging_root)?;
+    let partial_path = staging_root.join(format!("{bundle_name}.partial"));
+    let final_path = staging_root.join(&bundle_name);
+    fs::create_dir(&partial_path)?;
+
+    let mut iso = open_iso(&artifact_path)?;
+    let mut assets = Vec::new();
+    for asset in preview.assets {
+        let entry = find_iso_entry(&mut iso, &asset.source_path).ok_or_else(|| {
+            NoUsbError::Verification(format!(
+                "verified artifact no longer exposes {}",
+                asset.source_path
+            ))
+        })?;
+        let relative_path = safe_iso_relative_path(&asset.source_path)?;
+        let output_path = partial_path.join("assets").join(&relative_path);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        extract_iso_entry(&mut iso, &entry, &output_path)?;
+        let extracted_sha256 = sha256_file(&output_path)?;
+        assets.push(StagingAsset {
+            source_path: asset.source_path,
+            size_bytes: asset.size_bytes,
+            output_path: Some(final_path.join("assets").join(relative_path)),
+            sha256: Some(extracted_sha256),
+        });
+    }
+
+    let bundle = StagingBundle {
+        profile_id,
+        path: final_path.clone(),
+        artifact_path,
+        artifact_sha256: artifact_sha256.into(),
+        assets,
+        execution_enabled: false,
+    };
+    fs::write(partial_path.join("bundle.json"), bundle.to_json())?;
+    fs::write(
+        partial_path.join("README.txt"),
+        "Verified NoUSB staging bundle. This directory contains extracted installer boot assets only. It does not modify or select any boot entry, and execution is disabled.\n",
+    )?;
+    fs::rename(&partial_path, &final_path)?;
+    Ok(bundle)
+}
+
+const VM_REHEARSAL_STEPS: [&str; 8] = [
+    "capture-boot-backup",
+    "stage-verified-assets",
+    "register-temporary-entry",
+    "select-one-shot-entry",
+    "transfer-to-installer",
+    "verify-payload-in-ram",
+    "reboot-to-original-default",
+    "cleanup-temporary-state",
+];
+
+#[derive(Clone)]
+struct VmBootState {
+    original_default: String,
+    default_entry: String,
+    original_boot_order: Vec<String>,
+    boot_order: Vec<String>,
+    active_entry: String,
+    backup_captured: bool,
+    staged_assets: bool,
+    temporary_entry: bool,
+    one_shot_entry: Option<String>,
+    installer_attempted: bool,
+    ram_payload_observed: bool,
+    fallback_observed: bool,
+}
+
+impl VmBootState {
+    fn clean() -> Self {
+        Self {
+            original_default: "current-os".into(),
+            default_entry: "current-os".into(),
+            original_boot_order: vec!["current-os".into(), "firmware-recovery".into()],
+            boot_order: vec!["current-os".into(), "firmware-recovery".into()],
+            active_entry: "current-os".into(),
+            backup_captured: false,
+            staged_assets: false,
+            temporary_entry: false,
+            one_shot_entry: None,
+            installer_attempted: false,
+            ram_payload_observed: false,
+            fallback_observed: false,
+        }
+    }
+}
+
+pub fn rehearse_vm_one_shot(
+    backend: OneShotBootBackend,
+    profile_id: &str,
+) -> Result<VmRehearsalReport, NoUsbError> {
+    let _profile = find_profile(profile_id)?;
+    let mut failure_points = vec![None];
+    failure_points.extend(
+        VM_REHEARSAL_STEPS
+            .iter()
+            .map(|step| Some((*step).to_string())),
+    );
+    let mut scenarios = Vec::new();
+    for failure_after in failure_points {
+        scenarios.push(run_vm_rehearsal_scenario(backend, failure_after)?);
+    }
+    let all_invariants_hold = scenarios.iter().all(|scenario| scenario.invariants_hold);
+    Ok(VmRehearsalReport {
+        id: format!(
+            "vm-rehearsal-{}-{}-{}-{}",
+            backend.id(),
+            safe_filename(profile_id),
+            now_stamp(),
+            std::process::id()
+        ),
+        backend,
+        profile_id: profile_id.into(),
+        scenarios,
+        all_invariants_hold,
+        real_vm_executed: false,
+        host_boot_changes: false,
+        reference_urls: vec![
+            backend.reference_url().into(),
+            "https://uefi.org/specs/UEFI/2.11/03_Boot_Manager.html".into(),
+            "https://www.qemu.org/docs/master/system/invocation.html".into(),
+            "https://manpages.ubuntu.com/manpages/noble/man7/casper.7.html".into(),
+        ],
+    })
+}
+
+pub fn save_vm_rehearsal(
+    base_dir: &Path,
+    report: &VmRehearsalReport,
+) -> Result<PathBuf, NoUsbError> {
+    let directory = base_dir.join(".nousb").join("vm-rehearsals");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{}.json", safe_filename(&report.id)));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)?;
+    file.write_all(report.to_json().as_bytes())?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+fn run_vm_rehearsal_scenario(
+    backend: OneShotBootBackend,
+    failure_after: Option<String>,
+) -> Result<VmRehearsalScenario, NoUsbError> {
+    let mut state = VmBootState::clean();
+    let mut events = Vec::new();
+    let mut recovered = false;
+    for step in VM_REHEARSAL_STEPS {
+        apply_vm_rehearsal_step(&mut state, backend, step, &mut events)?;
+        if failure_after.as_deref() == Some(step) {
+            events.push(format!("interruption-injected-after:{step}"));
+            recover_vm_rehearsal_state(&mut state, &mut events);
+            recovered = true;
+            break;
+        }
+    }
+
+    let original_default_preserved = state.default_entry == state.original_default;
+    let boot_order_preserved = state.boot_order == state.original_boot_order;
+    let one_shot_cleared = state.one_shot_entry.is_none();
+    let temporary_entry_removed = !state.temporary_entry;
+    let staged_assets_removed = !state.staged_assets;
+    let fallback_sufficient = !state.installer_attempted || state.fallback_observed;
+    let invariants_hold = state.backup_captured
+        && original_default_preserved
+        && boot_order_preserved
+        && one_shot_cleared
+        && temporary_entry_removed
+        && staged_assets_removed
+        && state.active_entry == state.original_default
+        && fallback_sufficient;
+    let id = failure_after
+        .as_deref()
+        .map(|step| format!("interrupt-after-{step}"))
+        .unwrap_or_else(|| "complete-one-shot-cycle".into());
+
+    Ok(VmRehearsalScenario {
+        id,
+        failure_after,
+        events,
+        recovered,
+        original_default_preserved,
+        boot_order_preserved,
+        one_shot_cleared,
+        temporary_entry_removed,
+        staged_assets_removed,
+        installer_attempted: state.installer_attempted,
+        ram_payload_observed: state.ram_payload_observed,
+        fallback_observed: state.fallback_observed,
+        invariants_hold,
+    })
+}
+
+fn apply_vm_rehearsal_step(
+    state: &mut VmBootState,
+    backend: OneShotBootBackend,
+    step: &str,
+    events: &mut Vec<String>,
+) -> Result<(), NoUsbError> {
+    match step {
+        "capture-boot-backup" => {
+            state.backup_captured = true;
+            events.push("boot-state-backup-captured".into());
+        }
+        "stage-verified-assets" if state.backup_captured => {
+            state.staged_assets = true;
+            events.push("verified-assets-staged-on-vm-disk".into());
+        }
+        "register-temporary-entry" if state.staged_assets => {
+            state.temporary_entry = true;
+            events.push("temporary-nousb-entry-registered".into());
+        }
+        "select-one-shot-entry" if state.temporary_entry => {
+            state.one_shot_entry = Some("nousb-installer".into());
+            events.push(format!(
+                "{}:one-shot-selector-set",
+                backend_one_shot_selector(backend)
+            ));
+        }
+        "transfer-to-installer" if state.one_shot_entry.is_some() => {
+            state.one_shot_entry = None;
+            state.active_entry = "nousb-installer".into();
+            state.installer_attempted = true;
+            events.push("firmware-consumed-one-shot-before-transfer".into());
+            events.push("control-transferred-to-staged-installer".into());
+        }
+        "verify-payload-in-ram" if state.active_entry == "nousb-installer" => {
+            state.ram_payload_observed = true;
+            events.push("installer-reported-live-payload-in-ram".into());
+        }
+        "reboot-to-original-default" if state.installer_attempted => {
+            state.active_entry = state.original_default.clone();
+            state.fallback_observed = true;
+            events.push("second-boot-returned-to-original-default".into());
+        }
+        "cleanup-temporary-state" if state.active_entry == state.original_default => {
+            state.temporary_entry = false;
+            state.staged_assets = false;
+            events.push("temporary-entry-and-staged-assets-removed".into());
+        }
+        _ => {
+            return Err(NoUsbError::Verification(format!(
+                "VM rehearsal precondition failed at step {step}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn recover_vm_rehearsal_state(state: &mut VmBootState, events: &mut Vec<String>) {
+    if state.one_shot_entry.take().is_some() {
+        events.push("recovery-cleared-pending-one-shot-selector".into());
+    }
+    state.default_entry = state.original_default.clone();
+    state.boot_order = state.original_boot_order.clone();
+    state.active_entry = state.original_default.clone();
+    state.fallback_observed = true;
+    state.temporary_entry = false;
+    state.staged_assets = false;
+    events.push("recovery-restored-original-default-and-order".into());
+    events.push("recovery-removed-temporary-entry-and-assets".into());
+}
+
+fn backend_one_shot_selector(backend: OneShotBootBackend) -> &'static str {
+    match backend {
+        OneShotBootBackend::UefiBootNext => "UEFI BootNext",
+        OneShotBootBackend::WindowsBcdBootSequence => "BCD bootsequence",
+        OneShotBootBackend::LinuxSystemdBootOneShot => "LoaderEntryOneShot",
+        OneShotBootBackend::LinuxGrubReboot => "GRUB next_entry",
+    }
+}
+
+fn is_safe_filename(value: &str) -> bool {
+    if value.is_empty() || value == "." || value == ".." {
+        return false;
+    }
+    let mut components = Path::new(value).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+fn is_https_url(value: &str) -> bool {
+    value.starts_with("https://") && !value.chars().any(char::is_whitespace)
+}
+
+fn http_client() -> Result<Client, NoUsbError> {
+    Client::builder()
+        .redirect(Policy::limited(5))
+        .user_agent(concat!("NoUSB/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| NoUsbError::Network(error.to_string()))
+}
+
+fn validate_https_response(response: &Response) -> Result<(), NoUsbError> {
+    if response.url().scheme() != "https" {
+        return Err(NoUsbError::Network(format!(
+            "refused HTTPS downgrade redirect to {}",
+            response.url()
+        )));
+    }
+    Ok(())
+}
+
+pub fn sha256_file(path: &Path) -> Result<String, NoUsbError> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+pub fn verify_artifact(
+    profile_id: &str,
+    artifact_path: &Path,
+) -> Result<ArtifactManifest, NoUsbError> {
+    let manifest = artifact_manifest(profile_id)?;
+    verify_artifact_against_manifest(artifact_path, &manifest)?;
+    Ok(manifest)
+}
+
+fn verify_artifact_against_manifest(
+    artifact_path: &Path,
+    manifest: &ArtifactManifest,
+) -> Result<(), NoUsbError> {
+    let metadata = fs::metadata(artifact_path)?;
+    if !metadata.is_file() {
+        return Err(NoUsbError::Verification(format!(
+            "artifact path {} is not a regular file",
+            artifact_path.display()
+        )));
+    }
+    if metadata.len() != manifest.size_bytes {
+        return Err(NoUsbError::Verification(format!(
+            "artifact {} is {} bytes; expected {} bytes",
+            artifact_path.display(),
+            metadata.len(),
+            manifest.size_bytes
+        )));
+    }
+    let actual = sha256_file(artifact_path)?;
+    if !actual.eq_ignore_ascii_case(&manifest.sha256) {
+        return Err(NoUsbError::Verification(format!(
+            "artifact {} has SHA-256 {actual}; expected {}",
+            artifact_path.display(),
+            manifest.sha256
+        )));
+    }
+    Ok(())
+}
+
+struct DownloadLock {
+    path: PathBuf,
+}
+
+impl DownloadLock {
+    fn acquire(path: PathBuf) -> Result<Self, NoUsbError> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| {
+                NoUsbError::Io(format!(
+                    "cannot acquire download lock {}: {error}",
+                    path.display()
+                ))
+            })?;
+        writeln!(file, "pid={}", std::process::id())?;
+        file.sync_all()?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for DownloadLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn finalize_download(
+    manifest: ArtifactManifest,
+    partial_path: PathBuf,
+    final_path: PathBuf,
+    resumed_from_bytes: u64,
+    downloaded_bytes: u64,
+) -> Result<ArtifactDownload, NoUsbError> {
+    let actual_size = fs::metadata(&partial_path)?.len();
+    if actual_size != manifest.size_bytes {
+        return Err(NoUsbError::Verification(format!(
+            "downloaded artifact is {actual_size} bytes; expected {}. Partial data was retained",
+            manifest.size_bytes
+        )));
+    }
+    let actual_sha256 = sha256_file(&partial_path)?;
+    if !actual_sha256.eq_ignore_ascii_case(&manifest.sha256) {
+        return Err(NoUsbError::Verification(format!(
+            "downloaded artifact has SHA-256 {actual_sha256}; expected {}. Partial data was retained",
+            manifest.sha256
+        )));
+    }
+    if final_path.exists() {
+        return Err(NoUsbError::Verification(format!(
+            "refused to overwrite existing artifact {}",
+            final_path.display()
+        )));
+    }
+    fs::rename(&partial_path, &final_path)?;
+    Ok(ArtifactDownload {
+        manifest,
+        path: final_path,
+        resumed_from_bytes,
+        downloaded_bytes,
+        verified: true,
+        already_present: false,
+    })
+}
+
+struct FileDevice(File);
+
+impl IsoRead for FileDevice {
+    fn read(&mut self, position: usize, buffer: &mut [u8]) -> Option<()> {
+        let position = u64::try_from(position).ok()?;
+        self.0.seek(SeekFrom::Start(position)).ok()?;
+        self.0.read_exact(buffer).ok()
+    }
+}
+
+fn open_iso(path: &Path) -> Result<ISO9660, NoUsbError> {
+    let file = File::open(path)?;
+    ISO9660::from_device(FileDevice(file)).ok_or_else(|| {
+        NoUsbError::Verification(format!(
+            "{} is not a readable ISO9660 artifact",
+            path.display()
+        ))
+    })
+}
+
+fn safe_iso_relative_path(value: &str) -> Result<PathBuf, NoUsbError> {
+    if value.contains('\\') || value.contains(':') {
+        return Err(NoUsbError::Verification(format!("unsafe ISO path {value}")));
+    }
+    let trimmed = value.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.contains("//") {
+        return Err(NoUsbError::Verification(format!("unsafe ISO path {value}")));
+    }
+    let mut path = PathBuf::new();
+    for component in trimmed.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(NoUsbError::Verification(format!("unsafe ISO path {value}")));
+        }
+        path.push(component);
+    }
+    Ok(path)
+}
+
+fn iso_names_equal(entry_name: &str, requested: &str) -> bool {
+    entry_name
+        .split(';')
+        .next()
+        .unwrap_or(entry_name)
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(requested)
+}
+
+fn find_iso_entry(iso: &mut ISO9660, value: &str) -> Option<ISODirectoryEntry> {
+    let relative_path = safe_iso_relative_path(value).ok()?;
+    let components = relative_path
+        .iter()
+        .map(|component| component.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let mut directory_lba = iso.root().lba.get() as usize;
+    let mut directory_size = iso.root().data_length.get() as usize;
+    for (index, component) in components.iter().enumerate() {
+        // ISO9660 pads each directory sector with zeroes. `iso9660_simple` stops an
+        // iterator at that padding, so inspect every sector in a multi-sector
+        // directory instead of assuming all records occupy the first sector.
+        let sector_count = directory_size.saturating_add(2047) / 2048;
+        let mut matching_entry = None;
+        for sector_index in 0..sector_count.max(1) {
+            let directory = iso.read_directory(directory_lba.saturating_add(sector_index));
+            if let Some(entry) = (&directory).find(|entry| iso_names_equal(&entry.name, component))
+            {
+                matching_entry = Some(entry);
+                break;
+            }
+        }
+        let entry = matching_entry?;
+        if index + 1 == components.len() {
+            return Some(entry);
+        }
+        if !entry.is_folder() {
+            return None;
+        }
+        directory_lba = entry.lsb_position() as usize;
+        directory_size = entry.file_size() as usize;
+    }
+    None
+}
+
+fn extract_iso_entry(
+    iso: &mut ISO9660,
+    entry: &ISODirectoryEntry,
+    output_path: &Path,
+) -> Result<(), NoUsbError> {
+    let expected_size = u64::from(entry.file_size());
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(output_path)?;
+    let mut offset = 0_u64;
+    while offset < expected_size {
+        let remaining = expected_size - offset;
+        let chunk_size = usize::try_from(remaining.min(1024 * 1024)).map_err(|_| {
+            NoUsbError::Verification("ISO asset is too large for this platform".into())
+        })?;
+        let mut buffer = vec![0_u8; chunk_size];
+        let iso_offset = usize::try_from(offset).map_err(|_| {
+            NoUsbError::Verification("ISO asset offset is too large for this platform".into())
+        })?;
+        let read = iso
+            .read_file(entry, iso_offset, &mut buffer)
+            .ok_or_else(|| {
+                NoUsbError::Verification(format!("could not extract ISO entry {}", entry.name))
+            })?;
+        if read != chunk_size {
+            return Err(NoUsbError::Verification(format!(
+                "short read while extracting ISO entry {}",
+                entry.name
+            )));
+        }
+        output.write_all(&buffer)?;
+        offset += u64::try_from(read)
+            .map_err(|_| NoUsbError::Verification("ISO asset read size is invalid".into()))?;
+    }
+    output.sync_all()?;
+    if fs::metadata(output_path)?.len() != expected_size {
+        return Err(NoUsbError::Verification(format!(
+            "extracted ISO entry {} has an unexpected size",
+            entry.name
+        )));
+    }
+    Ok(())
 }
 
 pub fn plan_operation(
@@ -1508,6 +2804,242 @@ pub fn plan_operation_for_inventory(
     Ok(plan)
 }
 
+pub fn assess_delivery(
+    inventory: &SystemInventory,
+    profile_id: &str,
+) -> Result<DeliveryAssessment, NoUsbError> {
+    const UEFI_SPEC: &str = "https://uefi.org/specifications";
+    const DELL_BIOSCONNECT: &str =
+        "https://www.dell.com/support/kbdoc/en-us/000177771/using-biosconnect-to-recover-supportassist-os-recovery-partition";
+    const UBUNTU_CASPER: &str = "https://manpages.ubuntu.com/manpages/noble/man7/casper.7.html";
+    const GRUB_LOOPBACK: &str =
+        "https://www.gnu.org/software/grub/manual/grub/html_node/Loopback-booting.html";
+    const WINDOWS_BOOTSEQUENCE: &str =
+        "https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/bcdedit--bootsequence";
+    const WINDOWS_WINPE: &str =
+        "https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/winpe-mount-and-customize";
+    const IPXE_WIMBOOT: &str = "https://ipxe.org/wimboot";
+
+    let profile = find_profile(profile_id)?;
+    if inventory.os_name == "macos" {
+        return Ok(DeliveryAssessment {
+            host_os: inventory.os_name.clone(),
+            profile_id: profile.id,
+            recommended_route: None,
+            safe_default_execution_enabled: false,
+            universal_no_usb_guarantee: false,
+            summary: "macOS hosts are intentionally excluded from the current objective.".into(),
+            routes: vec![DeliveryRoute {
+                id: "macos-excluded".into(),
+                name: "macOS host delivery".into(),
+                readiness: DeliveryReadiness::OutOfScope,
+                payload_residency: PayloadResidency::PersistentStaging,
+                requires_persistent_staging: true,
+                requirements: vec![],
+                limitations: vec!["No macOS boot-policy or installer work is in scope.".into()],
+                reference_urls: vec![],
+            }],
+        });
+    }
+
+    let architecture_matches = profile.architecture == inventory.arch;
+    let uefi_known = inventory.firmware == FirmwareMode::Uefi;
+    let uefi_unavailable = inventory.firmware == FirmwareMode::Bios;
+    let enough_staging_space = inventory
+        .disk_inventory
+        .available_space_gb
+        .map(|available| available >= profile.required_free_space_gb);
+    let minimum_ram_mb = u64::from(profile.required_free_space_gb + 2) * 1024;
+    let enough_ram = inventory
+        .memory_total_mb
+        .map(|available| available >= minimum_ram_mb);
+    let mut routes = Vec::new();
+
+    if profile
+        .supported_staging_strategies
+        .contains(&StagingStrategy::KernelInitrd)
+    {
+        let readiness = if !architecture_matches || uefi_unavailable {
+            DeliveryReadiness::Unsupported
+        } else if !uefi_known || enough_staging_space != Some(true) || enough_ram != Some(true) {
+            DeliveryReadiness::RequiresHostCapability
+        } else {
+            DeliveryReadiness::DesignCandidate
+        };
+        let mut limitations = vec![
+            "RAM is volatile across reboot, so firmware must first load signed boot assets from disk or the network.".into(),
+            "The full-media RAM option needs more memory than the installer image plus runtime headroom.".into(),
+        ];
+        if let Some(available) = inventory.disk_inventory.available_space_gb {
+            if available < profile.required_free_space_gb {
+                limitations.push(format!(
+                    "Only {available} GB is reported free; the profile requires {} GB for staging.",
+                    profile.required_free_space_gb
+                ));
+            }
+        }
+        if let Some(available) = inventory.memory_total_mb {
+            if available < minimum_ram_mb {
+                limitations.push(format!(
+                    "Only {available} MB of RAM is reported; this conservative profile check requires at least {minimum_ram_mb} MB."
+                ));
+            }
+        }
+        routes.push(DeliveryRoute {
+            id: "host-staged-ram-boot".into(),
+            name: "Host-staged signed kernel/initrd, then copy live media to RAM".into(),
+            readiness,
+            payload_residency: PayloadResidency::FullLiveMediaInRam,
+            requires_persistent_staging: true,
+            requirements: vec![
+                "Verified official installer image and signed boot assets.".into(),
+                "Feature-gated Windows or Linux one-shot boot adapter with a boot backup.".into(),
+                "Installer-specific RAM-copy support such as Ubuntu casper toram.".into(),
+            ],
+            limitations,
+            reference_urls: vec![UBUNTU_CASPER.into(), WINDOWS_BOOTSEQUENCE.into()],
+        });
+    }
+
+    if inventory.os_name == "linux"
+        && profile
+            .supported_staging_strategies
+            .contains(&StagingStrategy::IsoLoopback)
+    {
+        let readiness = if !architecture_matches {
+            DeliveryReadiness::Unsupported
+        } else if enough_staging_space != Some(true) {
+            DeliveryReadiness::RequiresHostCapability
+        } else {
+            DeliveryReadiness::DesignCandidate
+        };
+        routes.push(DeliveryRoute {
+            id: "linux-grub-loopback".into(),
+            name: "Linux GRUB loopback boot from a verified ISO".into(),
+            readiness,
+            payload_residency: PayloadResidency::PersistentStaging,
+            requires_persistent_staging: true,
+            requirements: vec![
+                "GRUB must be able to read the filesystem containing the ISO.".into(),
+                "The target distribution initramfs must be able to locate its live root.".into(),
+                "A temporary or one-shot entry must preserve the existing default.".into(),
+            ],
+            limitations: vec![
+                "GRUB loopback support alone does not guarantee that the installer can find its root filesystem.".into(),
+            ],
+            reference_urls: vec![GRUB_LOOPBACK.into()],
+        });
+    }
+
+    if inventory.os_name == "windows"
+        && profile
+            .supported_staging_strategies
+            .contains(&StagingStrategy::WindowsMountedIsoSetup)
+    {
+        routes.push(DeliveryRoute {
+            id: "windows-mounted-setup".into(),
+            name: "Microsoft-supported setup from a verified mounted ISO".into(),
+            readiness: if architecture_matches && enough_staging_space == Some(true) {
+                DeliveryReadiness::DesignCandidate
+            } else {
+                DeliveryReadiness::RequiresHostCapability
+            },
+            payload_residency: PayloadResidency::PersistentStaging,
+            requires_persistent_staging: true,
+            requirements: vec![
+                "Official Microsoft media and supported Windows Setup flow.".into(),
+                "A full backup and typed confirmation for reinstall or replacement.".into(),
+            ],
+            limitations: vec![
+                "This is not a firmware-independent RAM boot and is limited to supported Windows Setup scenarios.".into(),
+            ],
+            reference_urls: vec![WINDOWS_WINPE.into(), WINDOWS_BOOTSEQUENCE.into()],
+        });
+    }
+
+    if profile.id == "windows-11" {
+        routes.push(DeliveryRoute {
+            id: "winpe-network-ramdisk".into(),
+            name: "Network-fetched WinPE RAM disk with a separate install source".into(),
+            readiness: if architecture_matches && !uefi_unavailable {
+                DeliveryReadiness::RequiresHostCapability
+            } else {
+                DeliveryReadiness::Unsupported
+            },
+            payload_residency: PayloadResidency::BootEnvironmentInRam,
+            requires_persistent_staging: false,
+            requirements: vec![
+                "UEFI HTTP Boot/PXE or a safely staged iPXE-compatible boot chain.".into(),
+                "A trusted HTTPS or local network source for WinPE and Windows installation files.".into(),
+                "Network drivers compatible with firmware and WinPE.".into(),
+            ],
+            limitations: vec![
+                "WinPE can run from RAM, but the Windows install payload must remain reachable from disk or the network.".into(),
+                "The current catalog does not yet contain a signed WinPE artifact manifest.".into(),
+            ],
+            reference_urls: vec![WINDOWS_WINPE.into(), IPXE_WIMBOOT.into()],
+        });
+    }
+
+    routes.push(DeliveryRoute {
+        id: "uefi-http-boot".into(),
+        name: "Firmware-native UEFI HTTP Boot".into(),
+        readiness: if uefi_unavailable || !architecture_matches {
+            DeliveryReadiness::Unsupported
+        } else {
+            DeliveryReadiness::RequiresHostCapability
+        },
+        payload_residency: PayloadResidency::BootEnvironmentInRam,
+        requires_persistent_staging: false,
+        requirements: vec![
+            "Firmware implementation with enabled UEFI HTTP Boot and a supported network device.".into(),
+            "Trusted boot URI, signed boot assets, and installer-specific network boot artifacts.".into(),
+        ],
+        limitations: vec![
+            "UEFI support does not imply HTTP Boot support; many PCs expose no usable HTTP Boot path.".into(),
+            "Wi-Fi support in preboot firmware is vendor and model dependent.".into(),
+        ],
+        reference_urls: vec![UEFI_SPEC.into()],
+    });
+
+    routes.push(DeliveryRoute {
+        id: "dell-biosconnect-reference".into(),
+        name: "Dell BIOSConnect comparison".into(),
+        readiness: DeliveryReadiness::Unsupported,
+        payload_residency: PayloadResidency::FirmwareManaged,
+        requires_persistent_staging: false,
+        requirements: vec!["Supported Dell firmware and Dell recovery service.".into()],
+        limitations: vec![
+            "BIOSConnect is vendor firmware, not an application-installable cross-vendor feature.".into(),
+            "It restores supported Dell Windows recovery environments and does not boot arbitrary OS profiles.".into(),
+        ],
+        reference_urls: vec![DELL_BIOSCONNECT.into()],
+    });
+
+    let recommended_route = [
+        "host-staged-ram-boot",
+        "windows-mounted-setup",
+        "linux-grub-loopback",
+    ]
+    .iter()
+    .find(|candidate| {
+        routes.iter().any(|route| {
+            route.id == **candidate && route.readiness == DeliveryReadiness::DesignCandidate
+        })
+    })
+    .map(|value| (*value).to_string());
+
+    Ok(DeliveryAssessment {
+        host_os: inventory.os_name.clone(),
+        profile_id: profile.id,
+        recommended_route,
+        safe_default_execution_enabled: false,
+        universal_no_usb_guarantee: false,
+        summary: "A cross-vendor no-USB workflow must use either firmware network boot or persistent one-shot staging; the installer may move into RAM only after boot begins.".into(),
+        routes,
+    })
+}
+
 pub fn write_journal_entry(base_dir: &Path, entry: &str) -> Result<PathBuf, NoUsbError> {
     let dir = base_dir.join(".nousb").join("journal");
     fs::create_dir_all(&dir)?;
@@ -1579,14 +3111,7 @@ pub fn verify_sha256_with_system_tool(path: &Path, expected: &str) -> Result<boo
             "expected SHA256 must be 64 hex characters".into(),
         ));
     }
-    let output = std::process::Command::new("sha256sum").arg(path).output()?;
-    if !output.status.success() {
-        return Err(NoUsbError::Io(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let actual = stdout.split_whitespace().next().unwrap_or_default();
+    let actual = sha256_file(path)?;
     Ok(actual.eq_ignore_ascii_case(expected))
 }
 
@@ -1619,6 +3144,7 @@ impl PlatformAdapter for HostPlatform {
         Ok(SystemInventory {
             os_name,
             arch,
+            memory_total_mb: None,
             firmware,
             secure_boot,
             encryption,
@@ -1939,7 +3465,7 @@ mod tests {
     #[test]
     fn embedded_profiles_parse_and_validate() {
         let profiles = embedded_profiles().unwrap();
-        assert_eq!(profiles.len(), 3);
+        assert_eq!(profiles.len(), 4);
         assert!(profiles.iter().all(|profile| profile.schema_version == "1"));
         assert!(profiles
             .iter()
@@ -2039,6 +3565,41 @@ post_boot_instructions = "None"
             .warnings
             .iter()
             .any(|warning| warning.contains("Secure Boot")));
+    }
+
+    #[test]
+    fn windows_to_ubuntu_assessment_recommends_staged_ram_design() {
+        let inventory = FakePlatformAdapter::windows_uefi_bitlocker()
+            .inspect()
+            .unwrap();
+        let assessment = assess_delivery(&inventory, "ubuntu-24.04-desktop").unwrap();
+
+        assert_eq!(
+            assessment.recommended_route.as_deref(),
+            Some("host-staged-ram-boot")
+        );
+        assert!(!assessment.safe_default_execution_enabled);
+        assert!(!assessment.universal_no_usb_guarantee);
+        assert!(assessment.routes.iter().any(|route| {
+            route.id == "host-staged-ram-boot"
+                && route.readiness == DeliveryReadiness::DesignCandidate
+                && route.requires_persistent_staging
+        }));
+    }
+
+    #[test]
+    fn macos_delivery_is_explicitly_out_of_scope() {
+        let inventory = FakePlatformAdapter::macos_apple_silicon_filevault()
+            .inspect()
+            .unwrap();
+        let assessment = assess_delivery(&inventory, "ubuntu-24.04-desktop").unwrap();
+
+        assert!(assessment.recommended_route.is_none());
+        assert_eq!(assessment.routes.len(), 1);
+        assert_eq!(
+            assessment.routes[0].readiness,
+            DeliveryReadiness::OutOfScope
+        );
     }
 
     #[test]
@@ -2211,5 +3772,355 @@ post_boot_instructions = "None"
         assert!(!log.contains("super-secret"));
 
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn artifact_manifests_pin_current_vendor_images() {
+        let ubuntu = artifact_manifest("ubuntu-24.04-desktop").unwrap();
+        assert_eq!(ubuntu.filename, "ubuntu-24.04.4-desktop-amd64.iso");
+        assert_eq!(ubuntu.size_bytes, 6_655_619_072);
+
+        let ubuntu_server = artifact_manifest("ubuntu-24.04-server").unwrap();
+        assert_eq!(
+            ubuntu_server.filename,
+            "ubuntu-24.04.4-live-server-amd64.iso"
+        );
+        assert_eq!(
+            ubuntu_server.sha256,
+            "e907d92eeec9df64163a7e454cbc8d7755e8ddc7ed42f99dbc80c40f1a138433"
+        );
+        assert_eq!(ubuntu_server.size_bytes, 3_405_469_696);
+        assert_eq!(
+            ubuntu.sha256,
+            "3a4c9877b483ab46d7c3fbe165a0db275e1ae3cfe56a5657e5a47c2f99a99d1e"
+        );
+
+        let fedora = artifact_manifest("fedora-44-workstation").unwrap();
+        assert_eq!(fedora.size_bytes, 2_851_612_672);
+        assert_eq!(
+            fedora.sha256,
+            "1620295f6a00c27c3208f0c00b8ece4eab1ec69b9002152d97488bf26a426ddf"
+        );
+    }
+
+    #[test]
+    fn vendor_mediated_windows_image_is_not_downloadable() {
+        assert!(matches!(
+            artifact_manifest("windows-11"),
+            Err(NoUsbError::ArtifactUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn sha256_verification_is_cross_platform() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "nousb-sha-test-{}-{}",
+            std::process::id(),
+            now_stamp()
+        ));
+        fs::create_dir_all(&base_dir).unwrap();
+        let path = base_dir.join("fixture.bin");
+        fs::write(&path, b"abc").unwrap();
+
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(verify_sha256_with_system_tool(
+            &path,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        )
+        .unwrap());
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn verified_partial_is_atomically_finalized() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "nousb-finalize-test-{}-{}",
+            std::process::id(),
+            now_stamp()
+        ));
+        fs::create_dir_all(&base_dir).unwrap();
+        let partial_path = base_dir.join("fixture.iso.part");
+        let final_path = base_dir.join("fixture.iso");
+        fs::write(&partial_path, b"abc").unwrap();
+        let manifest = ArtifactManifest {
+            profile_id: "fixture".into(),
+            filename: "fixture.iso".into(),
+            source_url: "https://example.invalid/fixture.iso".into(),
+            checksum_url: "https://example.invalid/SHA256SUMS".into(),
+            signature_url: None,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size_bytes: 3,
+        };
+
+        let result =
+            finalize_download(manifest, partial_path.clone(), final_path.clone(), 1, 2).unwrap();
+        assert!(result.verified);
+        assert_eq!(result.resumed_from_bytes, 1);
+        assert!(!partial_path.exists());
+        assert_eq!(fs::read(&final_path).unwrap(), b"abc");
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn staging_paths_reject_traversal_and_windows_separators() {
+        assert!(safe_iso_relative_path("/casper/vmlinuz").is_ok());
+        assert!(safe_iso_relative_path("../bootx64.efi").is_err());
+        assert!(safe_iso_relative_path("EFI/../bootx64.efi").is_err());
+        assert!(safe_iso_relative_path("EFI\\BOOT\\BOOTX64.EFI").is_err());
+        assert!(safe_iso_relative_path("C:/bootx64.efi").is_err());
+    }
+
+    #[test]
+    fn iso_names_accept_versioned_extensionless_files_with_trailing_dot() {
+        assert!(iso_names_equal("VMLINUZ.;1", "vmlinuz"));
+        assert!(iso_names_equal("INITRD.;1", "initrd"));
+        assert!(iso_names_equal("BOOTX64.EFI;1", "bootx64.efi"));
+        assert!(!iso_names_equal("VMLINUZ.OLD;1", "vmlinuz"));
+    }
+
+    #[test]
+    fn vm_rehearsal_matrix_preserves_default_and_recovers_every_interruption() {
+        let backends = [
+            OneShotBootBackend::UefiBootNext,
+            OneShotBootBackend::WindowsBcdBootSequence,
+            OneShotBootBackend::LinuxSystemdBootOneShot,
+            OneShotBootBackend::LinuxGrubReboot,
+        ];
+        for backend in backends {
+            let report = rehearse_vm_one_shot(backend, "ubuntu-24.04-desktop").unwrap();
+            assert_eq!(report.scenarios.len(), VM_REHEARSAL_STEPS.len() + 1);
+            assert!(report.all_invariants_hold);
+            assert!(!report.real_vm_executed);
+            assert!(!report.host_boot_changes);
+            assert!(report.scenarios.iter().all(|scenario| {
+                scenario.invariants_hold
+                    && scenario.original_default_preserved
+                    && scenario.boot_order_preserved
+                    && scenario.one_shot_cleared
+                    && scenario.temporary_entry_removed
+                    && scenario.staged_assets_removed
+            }));
+            let completed = &report.scenarios[0];
+            assert!(completed.installer_attempted);
+            assert!(completed.ram_payload_observed);
+            assert!(completed.fallback_observed);
+        }
+    }
+
+    #[test]
+    fn vm_rehearsal_uses_backend_specific_one_shot_selectors() {
+        let cases = [
+            (OneShotBootBackend::UefiBootNext, "UEFI BootNext"),
+            (
+                OneShotBootBackend::WindowsBcdBootSequence,
+                "BCD bootsequence",
+            ),
+            (
+                OneShotBootBackend::LinuxSystemdBootOneShot,
+                "LoaderEntryOneShot",
+            ),
+            (OneShotBootBackend::LinuxGrubReboot, "GRUB next_entry"),
+        ];
+        for (backend, selector) in cases {
+            let report = rehearse_vm_one_shot(backend, "ubuntu-24.04-desktop").unwrap();
+            assert!(report.scenarios[0]
+                .events
+                .iter()
+                .any(|event| event.contains(selector)));
+        }
+    }
+
+    #[test]
+    fn vm_rehearsal_report_is_saved_project_locally() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let base_dir =
+            std::env::temp_dir().join(format!("nousb-vm-report-{}-{unique}", std::process::id()));
+        let report = rehearse_vm_one_shot(
+            OneShotBootBackend::WindowsBcdBootSequence,
+            "ubuntu-24.04-desktop",
+        )
+        .unwrap();
+        let path = save_vm_rehearsal(&base_dir, &report).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+
+        assert!(path.starts_with(base_dir.join(".nousb/vm-rehearsals")));
+        assert!(contents.contains("\"all_invariants_hold\":true"));
+        assert!(contents.contains("\"real_vm_executed\":false"));
+        assert!(contents.contains("\"host_boot_changes\":false"));
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn synthetic_iso_is_verified_inspected_and_staged_end_to_end() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let base_dir =
+            std::env::temp_dir().join(format!("nousb-iso-fixture-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&base_dir).unwrap();
+        let artifact_path = base_dir.join("fixture.iso");
+        write_synthetic_iso(&artifact_path);
+
+        let digest = sha256_file(&artifact_path).unwrap();
+        let manifest = ArtifactManifest {
+            profile_id: "fixture-linux".into(),
+            filename: "fixture.iso".into(),
+            source_url: "https://example.invalid/fixture.iso".into(),
+            checksum_url: "https://example.invalid/SHA256SUMS".into(),
+            signature_url: None,
+            sha256: digest.clone(),
+            size_bytes: fs::metadata(&artifact_path).unwrap().len(),
+        };
+        verify_artifact_against_manifest(&artifact_path, &manifest).unwrap();
+
+        let mut profile = find_profile("ubuntu-24.04-desktop").unwrap();
+        profile.id = "fixture-linux".into();
+        profile.kernel_initrd_paths = vec!["/casper/vmlinuz".into(), "/casper/initrd".into()];
+        profile.bootloader_paths.clear();
+        let preview = inspect_staging_profile(&profile, &artifact_path).unwrap();
+        assert!(preview.artifact_verified);
+        assert_eq!(preview.assets.len(), 2);
+        assert!(!preview.execution_enabled);
+
+        let bundle = create_staging_bundle_from_preview(&base_dir, preview, &digest).unwrap();
+        assert!(bundle.path.join("bundle.json").exists());
+        assert!(bundle.path.join("README.txt").exists());
+        assert_eq!(
+            fs::read(bundle.path.join("assets/casper/vmlinuz")).unwrap(),
+            b"synthetic-linux-kernel"
+        );
+        assert_eq!(
+            fs::read(bundle.path.join("assets/casper/initrd")).unwrap(),
+            b"synthetic-initrd"
+        );
+        assert!(bundle.assets.iter().all(|asset| asset.sha256.is_some()));
+        assert!(!bundle.execution_enabled);
+
+        let mut wrong_manifest = manifest;
+        wrong_manifest.size_bytes += 1;
+        assert!(matches!(
+            verify_artifact_against_manifest(&artifact_path, &wrong_manifest),
+            Err(NoUsbError::Verification(_))
+        ));
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    fn write_synthetic_iso(path: &Path) {
+        const SECTOR_SIZE: usize = 2048;
+        const SECTOR_COUNT: usize = 24;
+        const ROOT_SECTOR: u32 = 20;
+        const CASPER_SECTOR: u32 = 21;
+        const KERNEL_SECTOR: u32 = 22;
+        const INITRD_SECTOR: u32 = 23;
+
+        let kernel = b"synthetic-linux-kernel";
+        let initrd = b"synthetic-initrd";
+        let mut image = vec![0_u8; SECTOR_SIZE * SECTOR_COUNT];
+
+        let pvd = 16 * SECTOR_SIZE;
+        image[pvd] = 1;
+        image[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        image[pvd + 6] = 1;
+        write_both_endian_u32(&mut image[pvd + 80..pvd + 88], SECTOR_COUNT as u32);
+        write_both_endian_u16(&mut image[pvd + 120..pvd + 124], 1);
+        write_both_endian_u16(&mut image[pvd + 124..pvd + 128], 1);
+        write_both_endian_u16(&mut image[pvd + 128..pvd + 132], SECTOR_SIZE as u16);
+        let root_record = iso_directory_record(ROOT_SECTOR, SECTOR_SIZE as u32, true, &[0]);
+        image[pvd + 156..pvd + 190].copy_from_slice(&root_record);
+        image[pvd + 881] = 1;
+
+        let terminator = 17 * SECTOR_SIZE;
+        image[terminator] = 255;
+        image[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        image[terminator + 6] = 1;
+
+        let root_offset = ROOT_SECTOR as usize * SECTOR_SIZE;
+        let mut cursor = root_offset;
+        cursor = write_iso_record(
+            &mut image,
+            cursor,
+            iso_directory_record(ROOT_SECTOR, SECTOR_SIZE as u32, true, &[0]),
+        );
+        cursor = write_iso_record(
+            &mut image,
+            cursor,
+            iso_directory_record(ROOT_SECTOR, SECTOR_SIZE as u32, true, &[1]),
+        );
+        let _ = write_iso_record(
+            &mut image,
+            cursor,
+            iso_directory_record(CASPER_SECTOR, SECTOR_SIZE as u32, true, b"CASPER"),
+        );
+
+        let casper_offset = CASPER_SECTOR as usize * SECTOR_SIZE;
+        let mut cursor = casper_offset;
+        cursor = write_iso_record(
+            &mut image,
+            cursor,
+            iso_directory_record(CASPER_SECTOR, SECTOR_SIZE as u32, true, &[0]),
+        );
+        cursor = write_iso_record(
+            &mut image,
+            cursor,
+            iso_directory_record(ROOT_SECTOR, SECTOR_SIZE as u32, true, &[1]),
+        );
+        cursor = write_iso_record(
+            &mut image,
+            cursor,
+            iso_directory_record(KERNEL_SECTOR, kernel.len() as u32, false, b"VMLINUZ;1"),
+        );
+        let _ = write_iso_record(
+            &mut image,
+            cursor,
+            iso_directory_record(INITRD_SECTOR, initrd.len() as u32, false, b"INITRD;1"),
+        );
+
+        let kernel_offset = KERNEL_SECTOR as usize * SECTOR_SIZE;
+        image[kernel_offset..kernel_offset + kernel.len()].copy_from_slice(kernel);
+        let initrd_offset = INITRD_SECTOR as usize * SECTOR_SIZE;
+        image[initrd_offset..initrd_offset + initrd.len()].copy_from_slice(initrd);
+        fs::write(path, image).unwrap();
+    }
+
+    fn iso_directory_record(lba: u32, size: u32, is_directory: bool, name: &[u8]) -> Vec<u8> {
+        let padding = usize::from(name.len() % 2 == 0);
+        let length = 33 + name.len() + padding;
+        let mut record = vec![0_u8; length];
+        record[0] = length as u8;
+        write_both_endian_u32(&mut record[2..10], lba);
+        write_both_endian_u32(&mut record[10..18], size);
+        record[18..25].copy_from_slice(&[126, 1, 1, 0, 0, 0, 0]);
+        record[25] = if is_directory { 2 } else { 0 };
+        write_both_endian_u16(&mut record[28..32], 1);
+        record[32] = name.len() as u8;
+        record[33..33 + name.len()].copy_from_slice(name);
+        record
+    }
+
+    fn write_iso_record(image: &mut [u8], offset: usize, record: Vec<u8>) -> usize {
+        let end = offset + record.len();
+        image[offset..end].copy_from_slice(&record);
+        end
+    }
+
+    fn write_both_endian_u16(target: &mut [u8], value: u16) {
+        target[..2].copy_from_slice(&value.to_le_bytes());
+        target[2..4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_both_endian_u32(target: &mut [u8], value: u32) {
+        target[..4].copy_from_slice(&value.to_le_bytes());
+        target[4..8].copy_from_slice(&value.to_be_bytes());
     }
 }
