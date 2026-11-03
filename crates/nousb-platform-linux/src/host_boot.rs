@@ -4,7 +4,9 @@
 //! Mechanism, as proven in the disposable one-shot matrix: `efibootmgr --create-only` adds an
 //! entry outside `BootOrder`, `--bootnext` selects it once, and cleanup deletes it.
 
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", feature = "real-linux-boot", test))]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
 use nousb_core::{CommandRunner, FirmwareMode, HostBootFacts, NoUsbError, SecureBootState};
