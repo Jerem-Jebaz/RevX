@@ -534,20 +534,28 @@ fn host_preflight(
         _ => {}
     }
     if let Some(fs_name) = facts.staging_filesystem.as_deref() {
+        let fs_lower = fs_name.to_ascii_lowercase();
         if !matches!(
-            fs_name.to_ascii_lowercase().as_str(),
+            fs_lower.as_str(),
             "ntfs" | "ext4" | "ext3" | "ext2" | "btrfs" | "xfs" | "vfat" | "fat32" | "exfat"
         ) {
             blockers.push(format!(
                 "staging filesystem {fs_name} is not known to be readable by the official GRUB"
             ));
         }
-        if fs_name.eq_ignore_ascii_case("ntfs") && family == LiveBootFamily::Dracut {
+        const FAT32_MAX_FILE_BYTES: u64 = 0xFFFF_FFFF;
+        if matches!(fs_lower.as_str(), "vfat" | "fat32") && iso_size_bytes > FAT32_MAX_FILE_BYTES {
+            blockers.push(format!(
+                "staging filesystem {fs_name} has a 4 GiB single-file limit; this ISO is {} GiB (choose another staging volume with --staging-root)",
+                iso_size_bytes / (1024 * 1024 * 1024)
+            ));
+        }
+        if fs_lower == "ntfs" && family == LiveBootFamily::Dracut {
             blockers.push(
                 "dracut live images cannot loop-mount an ISO from NTFS; stage it on an ext4/FAT/exFAT volume with --staging-root".into(),
             );
         }
-        if fs_name.eq_ignore_ascii_case("ntfs") && family == LiveBootFamily::Casper {
+        if fs_lower == "ntfs" && family == LiveBootFamily::Casper {
             warnings.push(
                 "casper must mount NTFS from its initramfs to find the ISO; this is a physical-test item (see docs/PHYSICAL_TESTING.md)".into(),
             );
@@ -891,6 +899,35 @@ fn run_arm_steps(
     state.boot_order_before = backend.boot_order()?;
     save_state(base_dir, state, "boot state backed up")?;
 
+    let mount = backend.mount_esp()?;
+    state.esp_mount = Some(mount.clone());
+    save_state(base_dir, state, &format!("ESP at {}", mount.path.display()))?;
+    let needed: u64 = 64 * 1024 * 1024;
+    if let Some(free) = backend.esp_free_bytes(&mount)? {
+        if free < needed {
+            return Err(NoUsbError::UnsafeExecution(format!(
+                "ESP has {} MiB free; at least {} MiB is required",
+                free / (1024 * 1024),
+                needed / (1024 * 1024)
+            )));
+        }
+    }
+    let efi_dir = mount.path.join("EFI");
+    if !efi_dir.is_dir() {
+        return Err(NoUsbError::UnsafeExecution(format!(
+            "{} has no EFI directory; this does not look like an EFI System Partition",
+            mount.path.display()
+        )));
+    }
+    let loader_dir_rel = format!("EFI/{HOST_BOOT_ESP_DIR}");
+    let loader_dir = mount.path.join(relative_native(&loader_dir_rel));
+    if loader_dir.exists() {
+        return Err(NoUsbError::UnsafeExecution(format!(
+            "{} already exists; refusing to overwrite (run `nousb boot cleanup` or inspect it)",
+            loader_dir.display()
+        )));
+    }
+
     // Staging volume: NoUSB/<token>/<iso> plus the marker GRUB searches for.
     let staging_parent = plan.staging_volume_root.join(HOST_BOOT_STAGING_DIR);
     if !staging_parent.exists() {
@@ -930,34 +967,6 @@ fn run_arm_steps(
     state.created_files.push(marker);
     save_state(base_dir, state, "ISO copied and verified")?;
 
-    let mount = backend.mount_esp()?;
-    state.esp_mount = Some(mount.clone());
-    save_state(base_dir, state, &format!("ESP at {}", mount.path.display()))?;
-    let needed: u64 = 64 * 1024 * 1024;
-    if let Some(free) = backend.esp_free_bytes(&mount)? {
-        if free < needed {
-            return Err(NoUsbError::UnsafeExecution(format!(
-                "ESP has {} MiB free; at least {} MiB is required",
-                free / (1024 * 1024),
-                needed / (1024 * 1024)
-            )));
-        }
-    }
-    let efi_dir = mount.path.join("EFI");
-    if !efi_dir.is_dir() {
-        return Err(NoUsbError::UnsafeExecution(format!(
-            "{} has no EFI directory; this does not look like an EFI System Partition",
-            mount.path.display()
-        )));
-    }
-    let loader_dir_rel = format!("EFI/{HOST_BOOT_ESP_DIR}");
-    let loader_dir = mount.path.join(relative_native(&loader_dir_rel));
-    if loader_dir.exists() {
-        return Err(NoUsbError::UnsafeExecution(format!(
-            "{} already exists; refusing to overwrite (run `nousb boot cleanup` or inspect it)",
-            loader_dir.display()
-        )));
-    }
     fs::create_dir(&loader_dir)?;
     state.esp_dirs.push(loader_dir_rel.clone());
     save_state(base_dir, state, "ESP loader directory created")?;
@@ -1097,7 +1106,11 @@ fn undo_transaction(
         save_state(base_dir, state, "firmware entry removed")?;
     }
 
-    if !state.esp_files.is_empty() || !state.esp_dirs.is_empty() {
+    let need_esp_cleanup = !state.esp_files.is_empty()
+        || !state.esp_dirs.is_empty()
+        || state.esp_mount.as_ref().is_some_and(|m| m.mounted_by_us);
+
+    if need_esp_cleanup {
         match backend.mount_esp() {
             Ok(mount) => {
                 for relative in state.esp_files.iter().rev() {
@@ -1120,6 +1133,7 @@ fn undo_transaction(
                 if errors.is_empty() {
                     state.esp_files.clear();
                     state.esp_dirs.clear();
+                    state.esp_mount = None;
                 }
             }
             Err(error) => errors.push(format!("mount ESP for cleanup: {error}")),
@@ -1519,6 +1533,26 @@ mod tests {
     }
 
     #[test]
+    fn fat32_staging_blocks_large_iso() {
+        let dir = std::env::temp_dir().join(format!("nousb-hb-fat32-{}", std::process::id()));
+        let mut host = facts(&dir);
+        host.staging_filesystem = Some("vfat".into());
+        let plan = plan_host_one_shot(
+            "ubuntu-24.04-desktop",
+            &dir.join("missing.iso"),
+            &host,
+            "fake",
+            true,
+        )
+        .unwrap();
+        assert!(!plan.ready());
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("4 GiB single-file limit")));
+    }
+
+    #[test]
     fn arm_refuses_wrong_phrase_and_preflight_blockers() {
         let dir = std::env::temp_dir().join(format!("nousb-hb-arm-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -1658,6 +1692,10 @@ mod tests {
             assert_eq!(state.phase, HostBootPhase::RolledBack, "{failure}");
             assert!(backend.boot_next.is_none(), "{failure}");
             assert_eq!(backend.entries.len(), 2, "{failure}");
+            assert!(
+                !backend.mounted,
+                "{failure}: ESP was not unmounted on rollback"
+            );
             assert!(!esp.join("EFI").join("NoUSB").exists(), "{failure}");
             assert!(!dir.join("NoUSB").exists(), "{failure}");
             let _ = fs::remove_dir_all(&dir);
@@ -1687,6 +1725,14 @@ mod tests {
             "user file"
         );
         assert!(backend.boot_next.is_none());
+        assert!(
+            !backend.mounted,
+            "ESP was not unmounted when loader dir already existed"
+        );
+        assert!(
+            !dir.join("NoUSB").exists(),
+            "staging directory should not be created if ESP check fails fast"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

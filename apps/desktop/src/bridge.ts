@@ -101,10 +101,10 @@ export const CLEANUP_PHRASE = "CLEAN UP NOUSB BOOT";
 
 export const bridge = {
   hostBootPlan: (profile: string, stagingRoot?: string) =>
-    call<HostBootPlan>("host_boot_plan", { profile, stagingRoot }),
+    call<HostBootPlan>("host_boot_plan", { profile, staging_root: stagingRoot }),
   hostBootStatus: () => call<HostBootState | null>("host_boot_status"),
   hostBootArm: (profile: string, confirmation: string, stagingRoot?: string) =>
-    call<HostBootState>("host_boot_arm", { profile, confirmation, stagingRoot }),
+    call<HostBootState>("host_boot_arm", { profile, confirmation, staging_root: stagingRoot }),
   hostBootCleanup: (confirmation: string) =>
     call<HostBootState>("host_boot_cleanup", { confirmation }),
   inventory: () => call<Inventory>("inventory"),
@@ -113,10 +113,10 @@ export const bridge = {
   planPreview: (kind: string, profile: string) =>
     call<Record<string, unknown>>("plan_preview", { kind, profile }),
   simulate: (kind: string, profile: string, interruptAfter?: number) =>
-    call<Record<string, unknown>>("simulate", { kind, profile, interruptAfter }),
+    call<Record<string, unknown>>("simulate", { kind, profile, interrupt_after: interruptAfter }),
   reports: () => call<SavedReport[]>("reports"),
   recover: (planId: string, action: "resume" | "rollback") =>
-    call<Record<string, unknown>>("recover", { planId, action }),
+    call<Record<string, unknown>>("recover", { plan_id: planId, action }),
   verifySignature: (profile: string) =>
     call<SignatureVerification>("verify_signature", { profile }),
   vmEvidence: () => call<VmEvidence[]>("vm_evidence"),

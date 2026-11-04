@@ -323,10 +323,13 @@ mod backend {
                 .unwrap_or(false);
             if in_order {
                 // Keep UEFI BootOrder exactly as it was.
-                self.runner.run_checked(
+                if let Err(error) = self.runner.run_checked(
                     "bcdedit",
                     &["/set", FWBOOTMGR, "displayorder", &guid, "/remove"],
-                )?;
+                ) {
+                    let _ = self.runner.run("bcdedit", &["/delete", &guid]);
+                    return Err(error);
+                }
             }
             if let Err(error) = configured {
                 let _ = self.runner.run("bcdedit", &["/delete", &guid]);
@@ -373,7 +376,7 @@ mod backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nousb_core::{EspMount, HostBootBackend, ScriptedCommandRunner};
+    use nousb_core::{CommandOutput, EspMount, HostBootBackend, ScriptedCommandRunner};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -514,5 +517,41 @@ mod tests {
             .unwrap();
         assert!(backend.runner.calls.iter().any(|call| call
             == "bcdedit /set {fwbootmgr} displayorder {abcdef01-2345-6789-abcd-ef0123456789} /remove"));
+    }
+
+    #[test]
+    fn display_order_removal_failure_deletes_copied_entry() {
+        let runner = ScriptedCommandRunner::new(|line| {
+            if line.starts_with("bcdedit /copy") {
+                ScriptedCommandRunner::ok("copied to {abcdef01-2345-6789-abcd-ef0123456789}.")
+            } else if line == "bcdedit /enum {fwbootmgr} /v" {
+                ScriptedCommandRunner::ok(&FWBOOTMGR_ENUM.replace(
+                    "timeout",
+                    "                        {abcdef01-2345-6789-abcd-ef0123456789}\ntimeout",
+                ))
+            } else if line.contains("displayorder") && line.contains("/remove") {
+                CommandOutput {
+                    stdout: String::new(),
+                    stderr: "access denied".into(),
+                    success: false,
+                }
+            } else {
+                ScriptedCommandRunner::ok("ok")
+            }
+        });
+        let mut backend = WindowsHostBootBackend::new(runner);
+        let mount = EspMount {
+            path: PathBuf::from("Z:\\"),
+            mounted_by_us: true,
+        };
+        let err = backend
+            .create_entry("NoUSB", "\\EFI\\NoUSB\\BOOTX64.EFI", &mount)
+            .unwrap_err();
+        assert!(err.to_string().contains("access denied"));
+        assert!(backend
+            .runner
+            .calls
+            .iter()
+            .any(|call| call == "bcdedit /delete {abcdef01-2345-6789-abcd-ef0123456789}"));
     }
 }
