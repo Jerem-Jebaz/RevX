@@ -115,8 +115,12 @@ Current feature flags to preserve:
 
 Done in this round: the host one-shot boot executor (`nousb boot plan | arm | status | cleanup`) behind `real-windows-boot` / `real-linux-boot`, with fake-backend transaction tests, scripted `bcdedit`/`efibootmgr` tests, the desktop "Boot once" view, and open-source release files. See `docs/PHYSICAL_TESTING.md`.
 
-- Run the physical test matrix in `docs/PHYSICAL_TESTING.md`: Windows NTFS to Ubuntu (casper reading NTFS), Linux ext4 to Ubuntu and Fedora, Secure Boot on and off. Record each run with the "Physical test report" issue template.
-- Add a WinPE-based route before claiming Windows as a target; keep Windows 11 fail-closed until then.
+Also done: `boot plan custom` for a user-supplied casper/dracut Linux live ISO (optional `--sha256`), a plan-only `boot plan windows-11`, `image status`, download and local-ISO controls in the desktop "Boot once" view, and a read-only check on a physical Windows 11 host that found and fixed a false "UEFI not detected" (see `docs/PHYSICAL_TESTING.md`).
+
+- Run the physical test matrix in `docs/PHYSICAL_TESTING.md`: Windows NTFS to Ubuntu (casper reading NTFS), Linux ext4 to Ubuntu and Fedora, Secure Boot on and off. Record each run with the "Physical test report" issue template. The Windows backend (`bcdedit` bootsequence) has still never armed on real firmware or in a VM.
+- Rehearse the Windows host path in a disposable Windows VM (OVMF) the way `scripts/vm/linux_host_boot_rehearsal.py` does for Linux.
+- Build the WinPE route for Windows as a target (UDF extraction, generated BCD, RAM-disk `boot.wim`, a Setup-readable staging volume) and prove it in a VM. `boot plan windows-11` stays plan-only until then.
+- Add live-boot families beyond casper and dracut for `boot plan custom` (Debian live-boot needs `findiso=` and a GRUB whose prefix is not the host's `\EFI\debian`; archiso needs `img_dev`/`img_loop`).
 - Add `@types/react` and a `tsconfig.json` so the desktop UI is type-checked in CI (Vite only transpiles today).
 
 Done in this round: the disposable current-OS guest, the real UEFI `BootNext` selector, firmware fallback, and the power-loss matrix (former steps 1 and 2); see `docs/VM_ONE_SHOT.md`.

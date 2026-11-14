@@ -23,12 +23,30 @@ What it does **not** do: it never partitions, formats, resizes, or decrypts anyt
 | Windows 10/11, UEFI, unencrypted staging volume | Ubuntu 24.04.4 Desktop/Server (casper) | Implemented. **Physical test needed:** casper must mount NTFS from its initramfs to find the ISO |
 | Windows 10/11, UEFI | Fedora 44 (dracut) | Blocked on NTFS (dracut cannot loop-mount from NTFS); use an exFAT/FAT32/ext4 staging volume with `--staging-root` |
 | Linux, UEFI, ext4/btrfs/xfs root without LUKS | Ubuntu 24.04.4, Fedora 44 | Implemented. The full `nousb boot arm` → one boot → return → `cleanup` cycle passes in disposable VMs from Ubuntu, Fedora, and Debian (see below). Needs `efibootmgr` installed; the plan blocks without it |
+| Windows or Linux, UEFI | Your own Linux live ISO (`custom`) | Implemented for casper (Ubuntu family) and dracut (Fedora family) images; anything else is blocked. Not part of the VM matrix |
 | BitLocker- or LUKS-encrypted staging volume | any | Blocked: GRUB cannot read it. Use another unencrypted volume with `--staging-root` |
 | Legacy BIOS / CSM | any | Blocked |
-| any | Windows 11 | Not supported: Microsoft issues only per-session download links that cannot be pinned, and booting Windows Setup without media needs a WinPE flow that does not exist yet |
+| any | Windows 11 | Plan-only. `nousb boot plan windows-11 --iso <path>` checks the ISO and the host and lists the blockers; `boot arm` refuses it in every build. Microsoft issues only per-session download links that cannot be pinned, Windows Setup cannot read ext4/btrfs/xfs, and the WinPE staging route is not implemented or VM-proven. From Windows, mount the ISO and run `setup.exe` yourself |
 | macOS | any | Out of scope |
 
 So "any OS to any OS" is **not** true today. The tested direction is Windows or Linux to an official Linux live installer.
+
+## Where the ISO comes from
+
+| Source | Command | What arming enforces |
+| --- | --- | --- |
+| Download by NoUSB | `nousb image download <profile>` (desktop: "Download and verify" in the Boot once view) | Pinned size and SHA-256 |
+| A copy of a pinned image you already have | `nousb boot plan <profile> --iso <path>` | The same pinned size and SHA-256; any other file is refused |
+| Your own Linux live ISO | `nousb boot plan custom --iso <path> --sha256 <hex from the vendor>` | The SHA-256 you supplied. Without `--sha256` the plan warns that the origin is unverified, and arming only proves that the staged copy equals your file |
+
+`nousb image status <profile>` shows whether the pinned image is present, partly downloaded, or absent. A custom ISO must carry `/EFI/BOOT/BOOTX64.EFI` and `grubx64.efi`, and its GRUB menu must be a casper or dracut live entry; the plan lists a blocker otherwise. With Secure Boot on, firmware accepts only loaders signed for it and falls back to the installed OS if it rejects one.
+
+## Read-only check on a Windows host
+
+On 2026-11-14 the default and `real-windows-boot` builds were run read-only on a physical Windows 11 PC (build 26300, UEFI, NTFS system volume, 200 MiB ESP); nothing was armed. Findings:
+
+- `HKLM\SYSTEM\CurrentControlSet\Control\PEFirmwareType` does not exist on that build, so the plan reported "UEFI firmware was not detected" on a UEFI machine. Firmware type now falls back to `%firmware_type%` and `GetFirmwareType`.
+- Without elevation, BitLocker state cannot be read (`Get-BitLockerVolume` and `manage-bde` both need Administrator), so an unelevated plan lists "encryption state unknown" as a blocker. Run the plan in an elevated terminal for the real answer.
 
 ## Disposable-VM evidence for Linux hosts
 
@@ -86,7 +104,7 @@ cargo build --release -p nousb --features real-linux-boot
 
 `nousb doctor` reports `real boot adapters: compiled in` for these builds.
 
-Desktop app: run `pnpm tauri build --features real-boot` in `apps/desktop`. Start the app elevated to arm. Its "Boot once" view shows the same plan, blockers, and typed phrases as the CLI.
+Desktop app: run `pnpm tauri build --features real-boot` in `apps/desktop`. Start the app elevated to arm. Its "Boot once" view downloads and verifies the pinned image (typed phrase `DOWNLOAD <profile>`), accepts an ISO you already have or your own Linux live ISO, and shows the same plan, blockers, and typed phrases as the CLI.
 
 ## Test procedure
 

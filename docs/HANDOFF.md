@@ -53,6 +53,8 @@ Ubuntu 24.04.4 and Fedora 44 now have direct official artifact manifests with ex
 
 `nousb boot plan <profile>` works in every build and prints the exact files, firmware entry, generated GRUB configuration, and every blocker. `nousb boot arm <profile> "BOOT ONCE INTO <profile>"` and `nousb boot cleanup "CLEAN UP NOUSB BOOT"` exist only in `real-windows-boot` / `real-linux-boot` builds. The transaction lives in `crates/nousb-core/src/host_boot.rs`; the platform backends are `crates/nousb-platform-windows/src/host_boot.rs` (`bcdedit` bootsequence) and `crates/nousb-platform-linux/src/host_boot.rs` (`efibootmgr` BootNext). State is persisted to `.nousb/host-boot/state.json` after every step. Physical results are still pending; see `docs/PHYSICAL_TESTING.md`.
 
+`plan_host_boot` in core routes every plan request for the CLI and the desktop app: catalog profiles (downloaded copy or `--iso`), `custom` (a user-supplied casper/dracut Linux live ISO, optional `--sha256`), and `windows-11` (plan-only; `BootTargetKind::WindowsSetup` is refused by `arm_host_one_shot` even with no blockers). The Linux host path passed in disposable VMs. The Windows host path has only been run read-only on a physical Windows 11 PC; it has never armed anywhere.
+
 ## First Commands To Run
 
 ```sh

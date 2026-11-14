@@ -23,11 +23,13 @@ pub use boot_hints::{
 };
 pub use host_boot::{
     arm_confirmation_phrase, arm_host_one_shot, cleanup_host_one_shot, derive_live_boot_recipe,
-    host_boot_dir, host_boot_state_path, load_host_boot_state, plan_host_one_shot,
-    render_grub_config, CommandOutput, CommandRunner, EspMount, FakeHostBootBackend,
-    HostBootBackend, HostBootFacts, HostBootPhase, HostBootPlan, HostBootState, LiveBootFamily,
-    LiveBootRecipe, PlannedFile, ScriptedCommandRunner, SystemCommandRunner,
-    CLEANUP_CONFIRMATION_PHRASE, HOST_BOOT_ENTRY_LABEL, HOST_BOOT_ESP_DIR, HOST_BOOT_STAGING_DIR,
+    host_boot_dir, host_boot_state_path, inspect_windows_iso, load_host_boot_state, plan_host_boot,
+    plan_host_one_shot, plan_host_one_shot_custom, plan_windows_setup_target, render_grub_config,
+    BootTargetKind, CommandOutput, CommandRunner, EspMount, FakeHostBootBackend, HostBootBackend,
+    HostBootFacts, HostBootPhase, HostBootPlan, HostBootState, IsoVerification, LiveBootFamily,
+    LiveBootRecipe, PlannedFile, ScriptedCommandRunner, SystemCommandRunner, WindowsIsoFacts,
+    CLEANUP_CONFIRMATION_PHRASE, CUSTOM_PROFILE_ID, HOST_BOOT_ENTRY_LABEL, HOST_BOOT_ESP_DIR,
+    HOST_BOOT_STAGING_DIR, WINDOWS_TARGET_PROFILE_ID,
 };
 pub use journal::{
     journal_database_path, journal_execution_report, migrate_saved_reports, open_journal,
@@ -1930,6 +1932,41 @@ pub fn artifact_cache_path(base_dir: &Path, profile_id: &str) -> Result<PathBuf,
         .join(&manifest.filename))
 }
 
+/// Where a profile's download stands on disk. Read-only; nothing is hashed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ArtifactStatus {
+    pub profile_id: String,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    /// The final file exists with the pinned size (its hash was checked when it was finalized).
+    pub present: bool,
+    /// Bytes in the resumable `.part` file, if any.
+    pub partial_bytes: u64,
+    /// A download holds the lock right now.
+    pub downloading: bool,
+}
+
+impl ArtifactStatus {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "null".into())
+    }
+}
+
+pub fn artifact_status(base_dir: &Path, profile_id: &str) -> Result<ArtifactStatus, NoUsbError> {
+    let manifest = artifact_manifest(profile_id)?;
+    let path = artifact_cache_path(base_dir, profile_id)?;
+    let size_of = |path: &Path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let partial = path.with_file_name(format!("{}.part", manifest.filename));
+    Ok(ArtifactStatus {
+        profile_id: manifest.profile_id,
+        present: path.is_file() && size_of(&path) == manifest.size_bytes,
+        partial_bytes: size_of(&partial),
+        downloading: path.with_file_name("download.lock").exists(),
+        path,
+        size_bytes: manifest.size_bytes,
+    })
+}
+
 pub fn probe_artifact(profile_id: &str) -> Result<ArtifactProbe, NoUsbError> {
     let manifest = artifact_manifest(profile_id)?;
     let response = http_client()?
@@ -2517,13 +2554,24 @@ struct DownloadLock {
 
 impl DownloadLock {
     fn acquire(path: PathBuf) -> Result<Self, NoUsbError> {
+        // A lock left by a download that was killed (closed window, power loss) would block
+        // every later attempt. Remove it only when its recorded process is provably gone.
+        if let Ok(text) = fs::read_to_string(&path) {
+            let owner = text
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("pid="))
+                .and_then(|pid| pid.parse::<u32>().ok());
+            if owner.and_then(process_alive) == Some(false) {
+                let _ = fs::remove_file(&path);
+            }
+        }
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&path)
             .map_err(|error| {
                 NoUsbError::Io(format!(
-                    "cannot acquire download lock {}: {error}",
+                    "cannot acquire download lock {} (is another download of this image running?): {error}",
                     path.display()
                 ))
             })?;
@@ -2531,6 +2579,29 @@ impl DownloadLock {
         file.sync_all()?;
         Ok(Self { path })
     }
+}
+
+/// Whether a process id is live; `None` when that cannot be determined (treated as live).
+fn process_alive(pid: u32) -> Option<bool> {
+    if pid == std::process::id() {
+        return Some(true);
+    }
+    if cfg!(target_os = "linux") {
+        return Some(Path::new(&format!("/proc/{pid}")).exists());
+    }
+    if cfg!(target_os = "windows") {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let listing = String::from_utf8_lossy(&output.stdout);
+        return Some(listing.contains(&format!("\"{pid}\"")));
+    }
+    None
 }
 
 impl Drop for DownloadLock {
@@ -2619,6 +2690,12 @@ pub(crate) fn read_iso_text_file(
         .ok_or_else(|| NoUsbError::Verification(format!("could not read {value} from the ISO")))?;
     buffer.truncate(read);
     Ok(Some(String::from_utf8_lossy(&buffer).into_owned()))
+}
+
+/// True when the ISO9660 view of `iso_path` contains the regular file `value`.
+pub(crate) fn iso_has_file(iso_path: &Path, value: &str) -> Result<bool, NoUsbError> {
+    let mut iso = open_iso(iso_path)?;
+    Ok(find_iso_entry(&mut iso, value).is_some_and(|entry| entry.is_file()))
 }
 
 /// Extracts one ISO file to a new path; `Ok(false)` when the ISO has no such file.

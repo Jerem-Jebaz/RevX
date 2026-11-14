@@ -3,8 +3,13 @@ import { createRoot } from "react-dom/client";
 import {
   bridge,
   CLEANUP_PHRASE,
+  CUSTOM_PROFILE,
+  WINDOWS_PROFILE,
+  downloadPhrase,
   isLive,
+  type BootSource,
   type HostBootPlan,
+  type ImageStatus,
   type HostBootState,
   type Inventory,
   type Profile,
@@ -26,6 +31,10 @@ const commands = [
   "cargo run -p nousb -- vm qemu rehearse-current-os-one-shot \"RUN DISPOSABLE CURRENT OS UEFI ONE-SHOT MATRIX\" linux-grub-reboot",
   "cargo run -p nousb -- vm qemu rehearse-secure-boot \"RUN DISPOSABLE SECURE BOOT REHEARSAL\"",
   "cargo run -p nousb -- image verify-signature ubuntu-24.04-server",
+  "cargo run -p nousb -- image status ubuntu-24.04-desktop",
+  "cargo run -p nousb -- boot plan ubuntu-24.04-desktop",
+  "cargo run -p nousb -- boot plan custom --iso <linux-live.iso> --sha256 <hex>",
+  "cargo run -p nousb -- boot plan windows-11 --iso <windows.iso>",
   "cargo run -p nousb -- --interrupt-after 2 simulate boot-once ubuntu-24.04-desktop",
   "cargo run -p nousb -- reports recover <plan-id>",
   "cargo run -p nousb -- journal migrate",
@@ -141,16 +150,99 @@ function Overview() {
   );
 }
 
+/** Returns `value` once it has stopped changing for `delay` ms, so typing does not re-plan per key. */
+function useDebounced<T>(value: T, delay = 500): T {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setSettled(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+  return settled;
+}
+
+const mib = (bytes: number): string => `${Math.round(bytes / (1024 * 1024))} MiB`;
+
+/** Download state of a pinned image, with the typed-phrase download control. */
+function ImagePanel({ profile, onChanged }: { profile: string; onChanged: () => void }) {
+  const status = useBridge<ImageStatus>(() => bridge.imageStatus(profile), [profile]);
+  const [phrase, setPhrase] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const active = busy || Boolean(status.data?.downloading);
+  useEffect(() => {
+    if (!active) return;
+    const timer = setInterval(status.refresh, 2000);
+    return () => clearInterval(timer);
+  }, [active, status.refresh]);
+  useEffect(() => {
+    setPhrase("");
+    setMessage(null);
+  }, [profile]);
+  const data = status.data;
+  if (!data) {
+    return <p className="muted">{status.error ?? "Checking the local image..."}</p>;
+  }
+  const start = () => {
+    setBusy(true);
+    setMessage(null);
+    bridge
+      .imageDownload(profile, phrase)
+      .then(() => setMessage("Downloaded and verified against the pinned size and SHA-256."))
+      .catch((reason: unknown) => setMessage(String(reason)))
+      .finally(() => {
+        setBusy(false);
+        setPhrase("");
+        status.refresh();
+        onChanged();
+      });
+  };
+  const state = data.present
+    ? "downloaded and verified"
+    : active
+      ? `downloading: ${mib(data.partial_bytes)} of ${mib(data.size_bytes)}`
+      : data.partial_bytes > 0
+        ? `partial: ${mib(data.partial_bytes)} of ${mib(data.size_bytes)} (download resumes)`
+        : "not downloaded";
+  return (
+    <>
+      <table>
+        <tbody>
+          <Row name="Official image" value={`${state} (${mib(data.size_bytes)})`} />
+          <Row name="Location" value={data.path} />
+        </tbody>
+      </table>
+      {message && <p className="muted">{message}</p>}
+      {!data.present && (
+        <p>
+          <label>
+            Type <code>{downloadPhrase(profile)}</code> to download{" "}
+            <input value={phrase} disabled={active} onChange={(event) => setPhrase(event.target.value)} />
+          </label>{" "}
+          <button className="copy" disabled={!isLive() || active || phrase !== downloadPhrase(profile)} onClick={start}>
+            {active ? "Downloading..." : data.partial_bytes > 0 ? "Resume download" : "Download and verify"}
+          </button>
+        </p>
+      )}
+    </>
+  );
+}
+
 function BootOnce() {
   const [profile, setProfile] = useState("ubuntu-24.04-desktop");
   const [stagingRoot, setStagingRoot] = useState("");
+  const [iso, setIso] = useState("");
+  const [sha256, setSha256] = useState("");
   const [phrase, setPhrase] = useState("");
   const [message, setMessage] = useState<string | null>(null);
-  const root = stagingRoot.trim() || undefined;
-  const plan = useBridge<HostBootPlan>(() => bridge.hostBootPlan(profile, root), [profile, root]);
+  const custom = profile === CUSTOM_PROFILE;
+  const windows = profile === WINDOWS_PROFILE;
+  const typed = useDebounced(`${stagingRoot.trim()}\n${iso.trim()}\n${custom ? sha256.trim() : ""}`);
+  const [root, isoPath, digest] = typed.split("\n");
+  const source: BootSource = { stagingRoot: root || undefined, iso: isoPath || undefined, sha256: digest || undefined };
+  const plan = useBridge<HostBootPlan>(() => bridge.hostBootPlan(profile, source), [profile, typed]);
   const status = useBridge<HostBootState | null>(bridge.hostBootStatus);
   const run = (action: Promise<HostBootState>, done: string) => {
-    setMessage("Working...");
+    setMessage("Working... copying and hashing a multi-gigabyte image takes several minutes.");
     action
       .then((state) => {
         setMessage(`${done} (${state.phase})`);
@@ -162,14 +254,34 @@ function BootOnce() {
   };
   const data = plan.data;
   const pending = status.data && ["preparing", "armed", "failed"].includes(status.data.phase);
+  const armable = data?.target_kind === "linux_live";
   return (
     <section>
       <SectionHead
         title="Boot Once Into an Installer"
-        detail={message ?? plan.error ?? "One firmware boot into a verified official live installer; every later boot returns to this OS."}
+        detail={message ?? plan.error ?? "One firmware boot into a live installer; every later boot returns to this OS."}
         risk={data ? (data.blockers.length === 0 ? "ready" : `${data.blockers.length} blocker(s)`) : undefined}
       />
-      <ProfilePicker value={profile} onChange={setProfile} />
+      <ProfilePicker value={profile} onChange={setProfile} extra={[CUSTOM_PROFILE]} />
+      {!custom && !windows && <ImagePanel profile={profile} onChanged={plan.refresh} />}
+      <p>
+        <label>
+          {custom
+            ? "Linux live ISO on this PC (required)"
+            : windows
+              ? "Windows ISO on this PC (you download it from Microsoft)"
+              : "Use an ISO you already have instead (optional)"}{" "}
+          <input size={48} value={iso} placeholder={custom || windows ? "full path to the .iso" : "default: the downloaded copy"} onChange={(event) => setIso(event.target.value)} />
+        </label>
+      </p>
+      {custom && (
+        <p>
+          <label>
+            Expected SHA-256 from the vendor (recommended){" "}
+            <input size={48} value={sha256} placeholder="64 hex digits" onChange={(event) => setSha256(event.target.value)} />
+          </label>
+        </p>
+      )}
       <p>
         <label>
           Staging volume root{" "}
@@ -187,6 +299,14 @@ function BootOnce() {
       )}
       {data && (
         <>
+          <table>
+            <tbody>
+              <Row name="Target" value={data.profile_name} />
+              <Row name="ISO" value={data.iso_path || "none"} />
+              <Row name="ISO identity" value={data.iso_verification.replace("_", " ")} />
+              <Row name="Real boot backend in this build" value={data.execution_enabled ? "yes" : "no (safe build)"} />
+            </tbody>
+          </table>
           <ul className="steps">
             {data.blockers.map((item) => (
               <li key={item}><strong>blocker</strong><span>{item}</span></li>
@@ -197,30 +317,38 @@ function BootOnce() {
           </ul>
           <h3>Steps</h3>
           <ol>{data.steps.map((step) => <li key={step}>{step}</li>)}</ol>
-          <h3>Files created (all removed by cleanup)</h3>
-          <ul>{data.files.map((file) => <li key={file.location + file.relative_path}>[{file.location}] {file.relative_path}</li>)}</ul>
-          <h3>Generated GRUB configuration</h3>
-          <pre>{data.grub_config}</pre>
+          {armable && (
+            <>
+              <h3>Files created (all removed by cleanup)</h3>
+              <ul>{data.files.map((file) => <li key={file.location + file.relative_path}>[{file.location}] {file.relative_path}</li>)}</ul>
+              <h3>Generated GRUB configuration</h3>
+              <pre>{data.grub_config}</pre>
+            </>
+          )}
           <h3>If anything goes wrong</h3>
           <ul>{data.recovery.map((line) => <li key={line}>{line}</li>)}</ul>
-          <p>
-            <label>
-              Type <code>{pending ? CLEANUP_PHRASE : data.confirmation_phrase}</code> to confirm{" "}
-              <input value={phrase} onChange={(event) => setPhrase(event.target.value)} />
-            </label>
-          </p>
+          {(pending || armable) && (
+            <p>
+              <label>
+                Type <code>{pending ? CLEANUP_PHRASE : data.confirmation_phrase}</code> to confirm{" "}
+                <input value={phrase} onChange={(event) => setPhrase(event.target.value)} />
+              </label>
+            </p>
+          )}
           {pending ? (
             <button className="copy" disabled={!isLive() || phrase !== CLEANUP_PHRASE} onClick={() => run(bridge.hostBootCleanup(phrase), "Cleanup finished")}>
               Clean up
             </button>
-          ) : (
+          ) : armable ? (
             <button
               className="copy"
               disabled={!isLive() || !data.execution_enabled || data.blockers.length > 0 || phrase !== data.confirmation_phrase}
-              onClick={() => run(bridge.hostBootArm(profile, phrase, root), "Armed: restart to boot the installer once")}
+              onClick={() => run(bridge.hostBootArm(profile, phrase, source), "Armed: restart to boot the installer once")}
             >
               Arm one-shot boot
             </button>
+          ) : (
+            <p className="muted">This target is plan-only. Nothing can be armed for it.</p>
           )}
         </>
       )}
@@ -405,7 +533,7 @@ const previewProfiles: Profile[] = [
   { id: "windows-11", name: "Windows 11", vendor: "Microsoft", version: "11", supported_staging_strategies: ["windows_mounted_iso_setup"], signing_key: null },
 ];
 
-function ProfilePicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+function ProfilePicker({ value, onChange, extra = [] }: { value: string; onChange: (value: string) => void; extra?: string[] }) {
   return (
     <p>
       <label>
@@ -413,6 +541,9 @@ function ProfilePicker({ value, onChange }: { value: string; onChange: (value: s
         <select value={value} onChange={(event) => onChange(event.target.value)}>
           {previewProfiles.map((profile) => (
             <option key={profile.id} value={profile.id}>{profile.id}</option>
+          ))}
+          {extra.map((id) => (
+            <option key={id} value={id}>{id === CUSTOM_PROFILE ? "custom (your own Linux live ISO)" : id}</option>
           ))}
         </select>
       </label>

@@ -246,13 +246,23 @@ fn real_boot_compiled() -> bool {
     ))
 }
 
+/// Empty or whitespace-only text from a form field counts as "not given".
+fn given(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
 fn build_host_boot_plan(
     profile: &str,
     staging_root: Option<String>,
+    iso: Option<String>,
+    sha256: Option<String>,
 ) -> Result<nousb_core::HostBootPlan, String> {
     let dir = project_dir()?;
-    let iso = nousb_core::artifact_cache_path(&dir, profile).map_err(error_text)?;
-    let root = staging_root
+    let iso = given(iso).map(PathBuf::from);
+    let sha256 = given(sha256);
+    let root = given(staging_root)
         .map(PathBuf::from)
         .unwrap_or_else(default_staging_root);
     let facts = host_boot_facts(&root)?;
@@ -261,14 +271,64 @@ fn build_host_boot_plan(
     } else {
         "linux-efibootmgr-bootnext"
     };
-    nousb_core::plan_host_one_shot(profile, &iso, &facts, backend, real_boot_compiled())
+    nousb_core::plan_host_boot(
+        &dir,
+        profile,
+        iso.as_deref(),
+        sha256.as_deref(),
+        &facts,
+        backend,
+        real_boot_compiled(),
+    )
+    .map_err(error_text)
+}
+
+/// Read-only: whether the profile's pinned image is on disk, partly downloaded, or absent.
+#[tauri::command]
+fn image_status(profile: String) -> CommandResult {
+    let dir = project_dir()?;
+    nousb_core::artifact_status(&dir, &profile)
+        .map(|status| status.to_json())
         .map_err(error_text)
+}
+
+/// Downloads (or resumes) the pinned official image and verifies size and SHA-256. Writes only
+/// under `.nousb/artifacts`; needs the same typed phrase as the TUI.
+#[tauri::command]
+async fn image_download(profile: String, confirmation: String) -> CommandResult {
+    blocking(move || {
+        let expected = format!("DOWNLOAD {profile}");
+        if confirmation != expected {
+            return Err(format!("typed confirmation must be exactly \"{expected}\""));
+        }
+        let dir = project_dir()?;
+        let download = nousb_core::download_artifact(&dir, &profile).map_err(error_text)?;
+        write_journal_entry(
+            &dir,
+            &format!(
+                "desktop downloaded verified artifact profile={profile} path={} already_present={}",
+                download.path.display(),
+                download.already_present
+            ),
+        )
+        .map_err(error_text)?;
+        Ok(download.to_json())
+    })
+    .await
 }
 
 /// Read-only: what arming would do on this host, with every blocker spelled out.
 #[tauri::command]
-async fn host_boot_plan(profile: String, staging_root: Option<String>) -> CommandResult {
-    blocking(move || build_host_boot_plan(&profile, staging_root).map(|plan| plan.to_json())).await
+async fn host_boot_plan(
+    profile: String,
+    staging_root: Option<String>,
+    iso: Option<String>,
+    sha256: Option<String>,
+) -> CommandResult {
+    blocking(move || {
+        build_host_boot_plan(&profile, staging_root, iso, sha256).map(|plan| plan.to_json())
+    })
+    .await
 }
 
 /// Read-only: the recorded host boot transaction, or `null`.
@@ -312,11 +372,13 @@ fn real_backend() -> Result<Box<dyn nousb_core::HostBootBackend>, String> {
 async fn host_boot_arm(
     profile: String,
     staging_root: Option<String>,
+    iso: Option<String>,
+    sha256: Option<String>,
     confirmation: String,
 ) -> CommandResult {
     blocking(move || {
         let dir = project_dir()?;
-        let plan = build_host_boot_plan(&profile, staging_root)?;
+        let plan = build_host_boot_plan(&profile, staging_root, iso, sha256)?;
         let mut backend = real_backend()?;
         nousb_core::arm_host_one_shot(&dir, &plan, backend.as_mut(), &confirmation)
             .map(|state| state.to_json())
@@ -349,6 +411,8 @@ fn main() {
             recover,
             verify_signature,
             vm_evidence,
+            image_status,
+            image_download,
             host_boot_plan,
             host_boot_status,
             host_boot_arm,
