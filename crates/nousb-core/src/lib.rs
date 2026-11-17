@@ -1957,11 +1957,12 @@ pub fn artifact_status(base_dir: &Path, profile_id: &str) -> Result<ArtifactStat
     let path = artifact_cache_path(base_dir, profile_id)?;
     let size_of = |path: &Path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     let partial = path.with_file_name(format!("{}.part", manifest.filename));
+    let lock_path = path.with_file_name("download.lock");
     Ok(ArtifactStatus {
         profile_id: manifest.profile_id,
         present: path.is_file() && size_of(&path) == manifest.size_bytes,
         partial_bytes: size_of(&partial),
-        downloading: path.with_file_name("download.lock").exists(),
+        downloading: is_download_lock_active(&lock_path),
         path,
         size_bytes: manifest.size_bytes,
     })
@@ -2548,6 +2549,25 @@ fn verify_artifact_against_manifest(
     Ok(())
 }
 
+/// Whether a download lock is held by a live process. If the lock file exists
+/// but its recorded process is provably gone, the stale lock is removed and this returns `false`.
+pub(crate) fn is_download_lock_active(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    if let Ok(text) = fs::read_to_string(path) {
+        let owner = text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("pid="))
+            .and_then(|pid| pid.parse::<u32>().ok());
+        if owner.and_then(process_alive) == Some(false) {
+            let _ = fs::remove_file(path);
+            return false;
+        }
+    }
+    true
+}
+
 struct DownloadLock {
     path: PathBuf,
 }
@@ -2556,15 +2576,7 @@ impl DownloadLock {
     fn acquire(path: PathBuf) -> Result<Self, NoUsbError> {
         // A lock left by a download that was killed (closed window, power loss) would block
         // every later attempt. Remove it only when its recorded process is provably gone.
-        if let Ok(text) = fs::read_to_string(&path) {
-            let owner = text
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("pid="))
-                .and_then(|pid| pid.parse::<u32>().ok());
-            if owner.and_then(process_alive) == Some(false) {
-                let _ = fs::remove_file(&path);
-            }
-        }
+        let _ = is_download_lock_active(&path);
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -4279,5 +4291,37 @@ post_boot_instructions = "None"
     fn write_both_endian_u32(target: &mut [u8], value: u32) {
         target[..4].copy_from_slice(&value.to_le_bytes());
         target[4..8].copy_from_slice(&value.to_be_bytes());
+    }
+
+    #[test]
+    fn artifact_status_removes_stale_download_lock_and_preserves_live_one() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "nousb-status-lock-{}-{}",
+            std::process::id(),
+            now_stamp()
+        ));
+        let artifact_dir = base_dir.join(".nousb/artifacts/ubuntu-24.04-server");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let lock_path = artifact_dir.join("download.lock");
+
+        // 1. Stale lock whose owning PID is provably gone.
+        fs::write(&lock_path, "pid=99999999\n").unwrap();
+        let status = artifact_status(&base_dir, "ubuntu-24.04-server").unwrap();
+        assert!(
+            !status.downloading,
+            "stale lock must report downloading = false"
+        );
+        assert!(!lock_path.exists(), "stale lock file must be cleaned up");
+
+        // 2. Active lock held by current process.
+        fs::write(&lock_path, format!("pid={}\n", std::process::id())).unwrap();
+        let status = artifact_status(&base_dir, "ubuntu-24.04-server").unwrap();
+        assert!(
+            status.downloading,
+            "live lock must report downloading = true"
+        );
+        assert!(lock_path.exists(), "live lock file must be preserved");
+
+        let _ = fs::remove_dir_all(&base_dir);
     }
 }

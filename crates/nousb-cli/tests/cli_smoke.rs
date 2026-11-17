@@ -734,6 +734,22 @@ fn boot_plan_for_a_pinned_profile_is_read_only_and_names_how_to_get_the_iso() {
     let stdout = String::from_utf8(status.stdout).expect("utf8 stdout");
     assert!(stdout.contains("present: false"));
     assert!(stdout.contains("downloading: false"));
+
+    // A stale lock file from a killed process is cleaned up by image status.
+    let lock_dir = dir.join(".nousb/artifacts/ubuntu-24.04-server");
+    std::fs::create_dir_all(&lock_dir).expect("create artifact dir");
+    let lock_path = lock_dir.join("download.lock");
+    std::fs::write(&lock_path, "pid=99999999\n").expect("write stale lock");
+    let status_with_stale = nousb()
+        .current_dir(&dir)
+        .args(["image", "status", "ubuntu-24.04-server"])
+        .output()
+        .expect("run nousb image status with stale lock");
+    assert!(status_with_stale.status.success());
+    let stdout = String::from_utf8(status_with_stale.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("downloading: false"));
+    assert!(!lock_path.exists());
+
     let _ = std::fs::remove_dir_all(dir);
 }
 
