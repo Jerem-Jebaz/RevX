@@ -70,6 +70,8 @@ jobs:
         run: npx --yes pnpm@10.18.3 install --frozen-lockfile
       - working-directory: apps/desktop
         run: npx --yes pnpm@10.18.3 run build
+      - working-directory: apps/desktop
+        run: npx --yes pnpm@10.18.3 run typecheck
       - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- -D warnings
       - run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --features real-boot -- -D warnings
