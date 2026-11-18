@@ -27,6 +27,7 @@ pub fn parse_windows_host_facts(stdout: &str, staging_root: &Path) -> HostBootFa
         missing_tools: vec![],
     };
     let mut manage_bde = String::new();
+    let mut shell_bitlocker = None;
     for line in stdout.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -37,6 +38,15 @@ pub fn parse_windows_host_facts(stdout: &str, staging_root: &Path) -> HostBootFa
             // PEFirmwareType: 1 = BIOS, 2 = UEFI.
             "firmware" if value == "2" => facts.firmware = FirmwareMode::Uefi,
             "firmware" if value == "1" => facts.firmware = FirmwareMode::Bios,
+            // `%firmware_type%`; the registry value above is absent on some Windows 11 builds.
+            "firmware_env" if facts.firmware == FirmwareMode::Unknown => {
+                if value.eq_ignore_ascii_case("UEFI") {
+                    facts.firmware = FirmwareMode::Uefi;
+                } else if value.eq_ignore_ascii_case("Legacy") || value.eq_ignore_ascii_case("BIOS")
+                {
+                    facts.firmware = FirmwareMode::Bios;
+                }
+            }
             "secure_boot" if value == "1" => facts.secure_boot = SecureBootState::Enabled,
             "secure_boot" if value == "0" => facts.secure_boot = SecureBootState::Disabled,
             "memory_bytes" => {
@@ -52,13 +62,42 @@ pub fn parse_windows_host_facts(stdout: &str, staging_root: &Path) -> HostBootFa
                 manage_bde.push_str(value);
                 manage_bde.push('\n');
             }
+            "shell_bitlocker" => shell_bitlocker = value.parse::<u32>().ok(),
             _ => {}
         }
     }
     if facts.staging_volume_encrypted.is_none() {
         facts.staging_volume_encrypted = parse_manage_bde_encrypted(&manage_bde);
     }
+    if facts.staging_volume_encrypted.is_none() {
+        // Explorer's System.Volume.BitLockerProtection, readable without elevation:
+        // 1 on, 2 off, 3 encrypting, 4 decrypting, 5 suspended, 6 locked. 0 and other values
+        // say nothing, so the state stays unknown and the elevated re-check decides.
+        facts.staging_volume_encrypted = match shell_bitlocker {
+            Some(2) => Some(false),
+            Some(1 | 3 | 4 | 5 | 6) => Some(true),
+            _ => None,
+        };
+    }
     facts
+}
+
+/// Firmware type from `kernel32!GetFirmwareType` (1 = BIOS, 2 = UEFI); independent of the
+/// registry and of PowerShell.
+#[cfg(target_os = "windows")]
+fn native_firmware_mode() -> FirmwareMode {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFirmwareType(firmware_type: *mut u32) -> i32;
+    }
+    let mut value = 0_u32;
+    // SAFETY: `value` is a valid, writable u32 for the duration of the call.
+    let ok = unsafe { GetFirmwareType(&mut value) };
+    match (ok != 0, value) {
+        (true, 1) => FirmwareMode::Bios,
+        (true, 2) => FirmwareMode::Uefi,
+        _ => FirmwareMode::Unknown,
+    }
 }
 
 /// English `manage-bde -status` fallback; any other language stays unknown (and blocks).
@@ -77,6 +116,7 @@ $root = $env:NOUSB_STAGING_ROOT
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 Write-Output "elevated=$($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
 Write-Output "firmware=$((Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name PEFirmwareType).PEFirmwareType)"
+Write-Output "firmware_env=$env:firmware_type"
 Write-Output "secure_boot=$((Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -Name UEFISecureBootEnabled).UEFISecureBootEnabled)"
 $null = Add-Type -AssemblyName Microsoft.VisualBasic
 Write-Output "memory_bytes=$((New-Object Microsoft.VisualBasic.Devices.ComputerInfo).TotalPhysicalMemory)"
@@ -87,6 +127,7 @@ $letter = $root.Substring(0, 2)
 $volume = Get-BitLockerVolume -MountPoint $letter
 if ($volume) { Write-Output "bitlocker_volume_status=$($volume.VolumeStatus)" }
 else { manage-bde -status $letter | ForEach-Object { Write-Output "manage_bde=$_" } }
+Write-Output "shell_bitlocker=$((New-Object -ComObject Shell.Application).NameSpace($letter).Self.ExtendedProperty('System.Volume.BitLockerProtection'))"
 "#;
 
 /// Read-only host facts for a staging volume root such as `C:\`. Unknowns stay unknown.
@@ -105,10 +146,12 @@ pub fn windows_host_boot_facts(staging_root: &Path) -> Result<HostBootFacts, NoU
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| NoUsbError::Io(format!("cannot query host facts: {error}")))?;
-    Ok(parse_windows_host_facts(
-        &String::from_utf8_lossy(&output.stdout),
-        Path::new(&root),
-    ))
+    let mut facts =
+        parse_windows_host_facts(&String::from_utf8_lossy(&output.stdout), Path::new(&root));
+    if facts.firmware == FirmwareMode::Unknown {
+        facts.firmware = native_firmware_mode();
+    }
+    Ok(facts)
 }
 
 /// The default staging root: the system drive (`C:\`).
@@ -467,6 +510,30 @@ mod tests {
             Path::new("D:\\"),
         );
         assert_eq!(localized.staging_volume_encrypted, None);
+    }
+
+    /// Output shape seen on a Windows 11 build without `PEFirmwareType`, queried unelevated.
+    #[test]
+    fn falls_back_when_the_registry_firmware_value_is_absent() {
+        let live = "elevated=False\nfirmware=\nfirmware_env=UEFI\nsecure_boot=0\nmemory_bytes=25439227904\nfree_bytes=197067124736\nformat=NTFS\nmanage_bde=ERROR: An attempt to access a required resource was denied.\nshell_bitlocker=0\n";
+        let facts = parse_windows_host_facts(live, Path::new("C:\\"));
+        assert_eq!(facts.firmware, FirmwareMode::Uefi);
+        assert_eq!(facts.secure_boot, SecureBootState::Disabled);
+        // Unelevated and Explorer says nothing useful: stays unknown, which blocks arming.
+        assert_eq!(facts.staging_volume_encrypted, None);
+
+        let registry_wins =
+            parse_windows_host_facts("firmware=1\nfirmware_env=UEFI\n", Path::new("C:\\"));
+        assert_eq!(registry_wins.firmware, FirmwareMode::Bios);
+        let off = parse_windows_host_facts("shell_bitlocker=2\n", Path::new("C:\\"));
+        assert_eq!(off.staging_volume_encrypted, Some(false));
+        let on = parse_windows_host_facts("shell_bitlocker=1\n", Path::new("C:\\"));
+        assert_eq!(on.staging_volume_encrypted, Some(true));
+        let elevated_wins = parse_windows_host_facts(
+            "bitlocker_volume_status=FullyEncrypted\nshell_bitlocker=2\n",
+            Path::new("C:\\"),
+        );
+        assert_eq!(elevated_wins.staging_volume_encrypted, Some(true));
     }
 
     #[test]

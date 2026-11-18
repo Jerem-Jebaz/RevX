@@ -696,6 +696,105 @@ fn dashboard_export_contains_preview_data() {
     assert!(stdout.contains("linux-luks-low-space"));
 }
 
+/// A fresh working directory, so `.nousb/` state from other tests or the repo is not seen.
+fn boot_scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "nousb-cli-boot-{name}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+#[test]
+fn boot_plan_for_a_pinned_profile_is_read_only_and_names_how_to_get_the_iso() {
+    let dir = boot_scratch("pinned");
+    let output = nousb()
+        .current_dir(&dir)
+        .args(["boot", "plan", "ubuntu-24.04-server"])
+        .output()
+        .expect("run nousb boot plan");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("Ready: no"));
+    assert!(stdout.contains("nousb image download ubuntu-24.04-server"));
+    assert!(stdout.contains("--iso"));
+    // Planning leaves no host boot transaction behind.
+    assert!(!dir.join(".nousb").join("host-boot").exists());
+
+    let status = nousb()
+        .current_dir(&dir)
+        .args(["image", "status", "ubuntu-24.04-server"])
+        .output()
+        .expect("run nousb image status");
+    assert!(status.status.success());
+    let stdout = String::from_utf8(status.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("present: false"));
+    assert!(stdout.contains("downloading: false"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn custom_boot_plan_needs_an_iso_and_reports_a_missing_one_as_a_blocker() {
+    let dir = boot_scratch("custom");
+    let bare = nousb()
+        .current_dir(&dir)
+        .args(["boot", "plan", "custom"])
+        .output()
+        .expect("run nousb boot plan custom");
+    assert!(!bare.status.success());
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("--iso"));
+
+    let missing = nousb()
+        .current_dir(&dir)
+        .args(["--json", "boot", "plan", "custom", "--iso", "no-such.iso"])
+        .output()
+        .expect("run nousb boot plan custom --iso");
+    assert!(missing.status.success());
+    let stdout = String::from_utf8(missing.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"profile_id\":\"custom\""));
+    assert!(stdout.contains("\"iso_verification\":\"unverified\""));
+    assert!(stdout.contains("custom ISO not found"));
+
+    let bad_digest = nousb()
+        .current_dir(&dir)
+        .args([
+            "boot", "plan", "custom", "--iso", "x.iso", "--sha256", "1234",
+        ])
+        .output()
+        .expect("run nousb boot plan custom --sha256");
+    assert!(!bad_digest.status.success());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn windows_target_is_plan_only_and_arming_it_is_refused() {
+    let dir = boot_scratch("windows");
+    let plan = nousb()
+        .current_dir(&dir)
+        .args(["--json", "boot", "plan", "windows-11"])
+        .output()
+        .expect("run nousb boot plan windows-11");
+    assert!(plan.status.success());
+    let stdout = String::from_utf8(plan.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"target_kind\":\"windows_setup\""));
+    assert!(stdout.contains("\"execution_enabled\":false"));
+    assert!(stdout.contains("plan-only"));
+    assert!(stdout.contains("\"files\":[]"));
+
+    let arm = nousb()
+        .current_dir(&dir)
+        .args(["boot", "arm", "windows-11", "BOOT ONCE INTO windows-11"])
+        .output()
+        .expect("run nousb boot arm windows-11");
+    assert!(!arm.status.success());
+    assert!(!dir.join(".nousb").join("host-boot").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn extract_json_string(source: &str, key: &str) -> Option<String> {
     let marker = format!("\"{key}\":\"");
     let start = source.find(&marker)? + marker.len();

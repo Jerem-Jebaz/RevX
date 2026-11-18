@@ -13,18 +13,20 @@ NoUSB downloads a pinned official installer image, verifies its exact size, SHA-
 | Inspect firmware, Secure Boot, encryption, ESP, boot entries (read-only) | yes | yes |
 | Download and verify Ubuntu 24.04.4 and Fedora 44 (size, SHA-256, OpenPGP) | yes | yes |
 | `nousb boot plan`: exact files, firmware entry, GRUB config, blockers | yes | yes |
+| Use an ISO you already have (`--iso`), or your own casper/dracut Linux live ISO (`boot plan custom`) | plan only | yes |
+| Windows 11 as the target (`boot plan windows-11`) | plan only, never armed | plan only, never armed |
 | `nousb boot arm`: one-shot boot into the live installer | refused | Windows/Linux UEFI, typed phrase |
 | `nousb boot cleanup`: remove the entry and every staged file | refused | yes |
 | Guided TUI (`nousb tui`) and desktop app (Tauri) | yes | desktop needs `real-boot` |
 | Disposable-VM evidence (QEMU/OVMF one-shot, fallback, power-loss matrix) | yes | yes |
 
-Supported directions are Windows or Linux (UEFI) to an official Linux live installer (Ubuntu casper, Fedora dracut). Windows 11 as a target, legacy BIOS, encrypted staging volumes, and macOS are not supported; [docs/PHYSICAL_TESTING.md](docs/PHYSICAL_TESTING.md) explains why. NoUSB never partitions, formats, or installs anything itself. Any installation happens in the official installer, by your choice.
+Supported directions are Windows or Linux (UEFI) to a Linux live installer: the pinned Ubuntu and Fedora images, or any casper (Ubuntu family) or dracut (Fedora family) live ISO you supply with `nousb boot plan custom --iso <path> --sha256 <hex>`. Windows 11 as a target is plan-only: `nousb boot plan windows-11 --iso <path>` checks your ISO and this PC and lists what is missing, but nothing can be armed for it. Legacy BIOS, encrypted staging volumes, and macOS are not supported; [docs/PHYSICAL_TESTING.md](docs/PHYSICAL_TESTING.md) explains why. NoUSB never partitions, formats, or installs anything itself. Any installation happens in the official installer, by your choice.
 
 ## Physical testing, short version
 
 ```sh
 cargo build --release -p nousb --features real-windows-boot     # or real-linux-boot
-nousb image download ubuntu-24.04-desktop
+nousb image download ubuntu-24.04-desktop                        # or: --iso <copy you already have>
 nousb boot plan ubuntu-24.04-desktop                             # must say "Ready: yes"
 nousb boot arm ubuntu-24.04-desktop "BOOT ONCE INTO ubuntu-24.04-desktop"   # elevated
 # reboot, try the live system, reboot back, then:
@@ -107,6 +109,7 @@ nousb image manifest <profile>
 nousb image probe <profile>
 nousb image verify-signature <profile>
 nousb image download <profile>
+nousb image status <profile>
 nousb image verify-profile <profile> <path>
 nousb image verify <path> <sha256>
 nousb staging inspect <profile> <path>
@@ -130,6 +133,8 @@ nousb vm qemu rehearse-current-os-baseline "RUN DISPOSABLE CURRENT OS UEFI BASEL
 nousb vm qemu plan-current-os-one-shot
 nousb vm qemu rehearse-current-os-one-shot "RUN DISPOSABLE CURRENT OS UEFI ONE-SHOT MATRIX" [scenario]
 nousb boot plan <profile> [--iso <path>] [--staging-root <volume-root>]
+nousb boot plan custom --iso <linux-live.iso> [--sha256 <hex>]
+nousb boot plan windows-11 [--iso <windows.iso>]
 nousb boot arm <profile> "BOOT ONCE INTO <profile>"
 nousb boot status
 nousb boot cleanup "CLEAN UP NOUSB BOOT"

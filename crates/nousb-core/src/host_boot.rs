@@ -12,14 +12,15 @@
 //! and every run requires the exact typed phrase from [`arm_confirmation_phrase`].
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::{
-    artifact_manifest, find_profile, now_stamp, read_iso_text_file, sha256_file,
-    write_journal_entry, FirmwareMode, NoUsbError, SecureBootState,
+    artifact_cache_path, artifact_manifest, find_profile, iso_has_file, now_stamp,
+    read_iso_text_file, sha256_file, write_journal_entry, FirmwareMode, NoUsbError,
+    SecureBootState,
 };
 
 /// Directory under the ESP's `\EFI` that holds the temporary loader chain.
@@ -48,6 +49,44 @@ const ISO_GRUB_CONFIGS: [&str; 3] = [
 /// Headroom beyond the ISO size before `toram`/`rd.live.ram` is requested.
 const RAM_COPY_HEADROOM_MB: u64 = 4096;
 
+/// Pseudo-profile for a Linux live ISO the user supplies. Nothing about it is pinned: the recipe
+/// comes from the ISO's own GRUB configuration and the digest from the user or from the file.
+pub const CUSTOM_PROFILE_ID: &str = "custom";
+/// The catalog profile whose media Microsoft only issues through per-session links.
+pub const WINDOWS_TARGET_PROFILE_ID: &str = "windows-11";
+
+/// What the planned one-shot entry would start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootTargetKind {
+    /// A Linux live installer loop-booted from its ISO. The only armable kind.
+    LinuxLive,
+    /// Windows Setup. Plan-only: `arm` refuses it in every build.
+    WindowsSetup,
+}
+
+/// How far the ISO's identity is established before arming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsoVerification {
+    /// Size and SHA-256 are pinned in the catalog (and vendor-signed).
+    Pinned,
+    /// The user supplied the SHA-256 to expect; arming enforces it.
+    UserSha256,
+    /// No expected digest: arming only proves the staged copy equals the source file.
+    Unverified,
+}
+
+impl IsoVerification {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned in the catalog",
+            Self::UserSha256 => "SHA-256 supplied by you",
+            Self::Unverified => "unverified, no expected SHA-256",
+        }
+    }
+}
+
 pub fn arm_confirmation_phrase(profile_id: &str) -> String {
     format!("BOOT ONCE INTO {profile_id}")
 }
@@ -59,6 +98,8 @@ pub enum LiveBootFamily {
     Casper,
     /// Fedora and other dracut live images: `iso-scan/filename=` and `rd.live.ram=1`.
     Dracut,
+    /// Windows Setup (WinPE `boot.wim`). Never rendered into a GRUB configuration.
+    WindowsSetup,
 }
 
 impl LiveBootFamily {
@@ -66,6 +107,7 @@ impl LiveBootFamily {
         match self {
             Self::Casper => "casper",
             Self::Dracut => "dracut",
+            Self::WindowsSetup => "windows_setup",
         }
     }
 }
@@ -228,8 +270,11 @@ pub struct HostBootPlan {
     pub backend: String,
     pub iso_path: PathBuf,
     pub iso_filename: String,
+    /// Lowercase hex digest arming enforces; empty when [`IsoVerification::Unverified`].
     pub iso_sha256: String,
     pub iso_size_bytes: u64,
+    pub iso_verification: IsoVerification,
+    pub target_kind: BootTargetKind,
     pub recipe: LiveBootRecipe,
     pub ram_copy: bool,
     pub staging_volume_root: PathBuf,
@@ -270,7 +315,13 @@ impl HostBootPlan {
             self.profile_name, self.profile_id, self.host_os, self.backend
         ));
         out.push_str(&format!(
-            "Live family: {} (from official {}), RAM copy: {}\n",
+            "ISO: {} ({} bytes, {})\n",
+            self.iso_path.display(),
+            self.iso_size_bytes,
+            self.iso_verification.as_str()
+        ));
+        out.push_str(&format!(
+            "Live family: {} (from {}), RAM copy: {}\n",
             self.recipe.family.as_str(),
             self.recipe.source_config,
             self.ram_copy
@@ -293,6 +344,11 @@ impl HostBootPlan {
         for (index, step) in self.steps.iter().enumerate() {
             out.push_str(&format!("  {}. {step}\n", index + 1));
         }
+        if self.target_kind == BootTargetKind::WindowsSetup {
+            out.push_str("Files created: none (plan-only target)\n");
+            out.push_str("Arming is refused for this target in every build.\n");
+            return out;
+        }
         out.push_str("Files created (all removed by cleanup):\n");
         for file in &self.files {
             out.push_str(&format!(
@@ -308,16 +364,41 @@ impl HostBootPlan {
         for line in &self.recovery {
             out.push_str(&format!("  - {line}\n"));
         }
+        // Always name the ISO, so arming uses the same file this plan was made for.
+        let iso_hint = format!(" --iso \"{}\"", self.iso_path.display());
+        let sha_hint = if self.iso_verification == IsoVerification::UserSha256 {
+            format!(" --sha256 {}", self.iso_sha256)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "To arm (needs an elevated shell and a real-boot build): nousb boot arm {} \"{}\"\n",
+            "To arm (needs an elevated shell and a real-boot build): nousb boot arm {} \"{}\"{iso_hint}{sha_hint}\n",
             self.profile_id, self.confirmation_phrase
         ));
         out
     }
 }
 
-/// Plans a one-shot boot from facts and an already-verified ISO path. Pure apart from reading
-/// the ISO's GRUB configuration; blockers are reported, never silently waived.
+/// Where the ISO comes from and how far its identity is established.
+struct BootSource {
+    profile_id: String,
+    profile_name: String,
+    /// Display name used in the GRUB menu title.
+    title: String,
+    /// File name of the staged copy; always GRUB-safe.
+    filename: String,
+    /// Expected size for pinned media; `None` takes the file's own size.
+    expected_size: Option<u64>,
+    /// Lowercase hex digest to enforce; empty when unverified.
+    sha256: String,
+    verification: IsoVerification,
+    /// Kernel/initrd paths shown before the ISO is available.
+    placeholder_paths: Vec<String>,
+    missing_hint: String,
+}
+
+/// Plans a one-shot boot of a catalog profile from facts and an ISO path. Pure apart from
+/// reading the ISO's GRUB configuration; blockers are reported, never silently waived.
 pub fn plan_host_one_shot(
     profile_id: &str,
     iso_path: &Path,
@@ -327,55 +408,401 @@ pub fn plan_host_one_shot(
 ) -> Result<HostBootPlan, NoUsbError> {
     let profile = find_profile(profile_id)?;
     let manifest = artifact_manifest(profile_id)?;
+    let source = BootSource {
+        profile_id: profile.id.clone(),
+        profile_name: format!("{} {}", profile.name, profile.version),
+        title: profile.name.clone(),
+        filename: manifest.filename,
+        expected_size: Some(manifest.size_bytes),
+        sha256: manifest.sha256,
+        verification: IsoVerification::Pinned,
+        placeholder_paths: profile.kernel_initrd_paths.clone(),
+        missing_hint: format!(
+            "run `nousb image download {profile_id}` first, or pass a copy you already have with --iso"
+        ),
+    };
+    plan_from_source(source, iso_path, facts, backend, execution_enabled)
+}
+
+/// Plans a one-shot boot of a Linux live ISO the user supplies (profile id `custom`). The
+/// recipe is derived from the ISO's own GRUB configuration and fails closed for anything that
+/// is not a casper or dracut live image. `expected_sha256` should come from the vendor's
+/// checksum file; without it the plan warns that the image's origin is unverified.
+pub fn plan_host_one_shot_custom(
+    iso_path: &Path,
+    expected_sha256: Option<&str>,
+    facts: &HostBootFacts,
+    backend: &str,
+    execution_enabled: bool,
+) -> Result<HostBootPlan, NoUsbError> {
+    let sha256 = match expected_sha256 {
+        Some(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            if value.len() != 64 || !value.chars().all(|digit| digit.is_ascii_hexdigit()) {
+                return Err(NoUsbError::InvalidInput(
+                    "--sha256 must be the 64 hex digits of the vendor's SHA-256".into(),
+                ));
+            }
+            value
+        }
+        None => String::new(),
+    };
+    let original = iso_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let source = BootSource {
+        profile_id: CUSTOM_PROFILE_ID.into(),
+        profile_name: format!("Custom Linux live ISO ({original})"),
+        title: "Custom Linux live ISO".into(),
+        filename: grub_safe_iso_filename(&original),
+        expected_size: None,
+        verification: if sha256.is_empty() {
+            IsoVerification::Unverified
+        } else {
+            IsoVerification::UserSha256
+        },
+        sha256,
+        placeholder_paths: vec![],
+        missing_hint: "pass an existing Linux live ISO with --iso".into(),
+    };
+    plan_from_source(source, iso_path, facts, backend, execution_enabled)
+}
+
+/// Routes a plan request by profile id: `custom` needs `iso`, `windows-11` is plan-only, and
+/// catalog profiles use `iso` or the verified download under `.nousb/artifacts`.
+pub fn plan_host_boot(
+    base_dir: &Path,
+    profile_id: &str,
+    iso: Option<&Path>,
+    expected_sha256: Option<&str>,
+    facts: &HostBootFacts,
+    backend: &str,
+    execution_enabled: bool,
+) -> Result<HostBootPlan, NoUsbError> {
+    match profile_id {
+        CUSTOM_PROFILE_ID => {
+            let iso = iso.ok_or_else(|| {
+                NoUsbError::InvalidInput(
+                    "the custom profile needs a Linux live ISO: --iso <path> [--sha256 <hex>]"
+                        .into(),
+                )
+            })?;
+            plan_host_one_shot_custom(iso, expected_sha256, facts, backend, execution_enabled)
+        }
+        WINDOWS_TARGET_PROFILE_ID => Ok(plan_windows_setup_target(iso, facts, backend)),
+        _ => {
+            if expected_sha256.is_some() {
+                return Err(NoUsbError::InvalidInput(format!(
+                    "{profile_id} is pinned in the catalog; --sha256 applies to the custom profile only"
+                )));
+            }
+            match iso {
+                Some(path) => {
+                    plan_host_one_shot(profile_id, path, facts, backend, execution_enabled)
+                }
+                None => {
+                    let cached = artifact_cache_path(base_dir, profile_id)?;
+                    plan_host_one_shot(profile_id, &cached, facts, backend, execution_enabled)
+                }
+            }
+        }
+    }
+}
+
+/// Keeps the user's file name when GRUB can take it unquoted; otherwise a fixed name.
+fn grub_safe_iso_filename(original: &str) -> String {
+    let safe = !original.is_empty()
+        && original.len() <= 96
+        && original.to_ascii_lowercase().ends_with(".iso")
+        && !original.starts_with('.')
+        && original
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || "._-".contains(value));
+    if safe {
+        original.into()
+    } else {
+        "custom-live.iso".into()
+    }
+}
+
+/// What a Windows ISO reveals without a UDF reader: its size, ISO9660 volume label, and
+/// whether a UDF file system (where Microsoft puts the real content) is present.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsIsoFacts {
+    pub size_bytes: u64,
+    pub volume_id: String,
+    pub udf: bool,
+}
+
+/// Reads the volume recognition sequence (sectors 16 onwards) of an optical disc image.
+pub fn inspect_windows_iso(path: &Path) -> Result<WindowsIsoFacts, NoUsbError> {
+    const SECTOR: usize = 2048;
+    let mut file = fs::File::open(path)?;
+    let size_bytes = file.metadata()?.len();
+    let mut volume_id = None;
+    let mut udf = false;
+    let mut sector = [0_u8; SECTOR];
+    for index in 16_u64..48 {
+        if file.seek(SeekFrom::Start(index * SECTOR as u64)).is_err()
+            || file.read_exact(&mut sector).is_err()
+        {
+            break;
+        }
+        match &sector[1..6] {
+            b"CD001" if sector[0] == 1 => {
+                volume_id = Some(
+                    String::from_utf8_lossy(&sector[40..72])
+                        .trim_matches(|value: char| value == ' ' || value == '\0')
+                        .to_string(),
+                );
+            }
+            b"NSR02" | b"NSR03" => udf = true,
+            b"CD001" | b"BEA01" | b"TEA01" | b"BOOT2" => {}
+            _ => break,
+        }
+    }
+    match volume_id {
+        Some(volume_id) => Ok(WindowsIsoFacts {
+            size_bytes,
+            volume_id,
+            udf,
+        }),
+        None if udf => Ok(WindowsIsoFacts {
+            size_bytes,
+            volume_id: String::new(),
+            udf,
+        }),
+        None => Err(NoUsbError::Verification(format!(
+            "{} is not an optical disc image",
+            path.display()
+        ))),
+    }
+}
+
+/// Plan-only assessment for Windows Setup as the target. It lists what a no-USB route would
+/// need and every blocker on this host, creates nothing, and can never be armed: the route is
+/// not implemented and has no disposable-VM evidence.
+pub fn plan_windows_setup_target(
+    iso: Option<&Path>,
+    facts: &HostBootFacts,
+    backend: &str,
+) -> HostBootPlan {
+    let mut blockers = vec![
+        "Windows Setup is a plan-only target: staging WinPE and booting it once is not implemented and has no disposable-VM evidence, so `nousb boot arm` refuses it in every build".to_string(),
+    ];
+    let mut warnings = vec![
+        "Microsoft publishes no stable ISO link, so NoUSB can neither download nor pin this image. Download it yourself and compare its SHA-256 with the values on Microsoft's download page".to_string(),
+    ];
+    let mut iso_facts = None;
+    match iso {
+        None => blockers.push(
+            "no Windows ISO given: download it from https://www.microsoft.com/software-download/windows11 and pass --iso <path>".into(),
+        ),
+        Some(path) => match inspect_windows_iso(path) {
+            Ok(found) if found.udf => iso_facts = Some(found),
+            Ok(_) => blockers.push(format!(
+                "{} has no UDF file system, so it is not Microsoft Windows Setup media",
+                path.display()
+            )),
+            Err(error) => blockers.push(format!("{} cannot be used: {error}", path.display())),
+        },
+    }
+    let iso_size_bytes = iso_facts.as_ref().map_or(0, |found| found.size_bytes);
+
+    if facts.firmware != FirmwareMode::Uefi {
+        blockers.push(
+            "UEFI firmware was not detected; legacy BIOS one-shot boot is not supported".into(),
+        );
+    }
+    if facts.staging_volume_encrypted == Some(true) {
+        blockers.push(format!(
+            "staging volume {} is encrypted; Windows Setup cannot read its sources from a BitLocker/LUKS volume before it starts",
+            facts.staging_volume_root.display()
+        ));
+    }
+    match facts.staging_filesystem.as_deref() {
+        Some(name) => {
+            let lower = name.to_ascii_lowercase();
+            if !matches!(lower.as_str(), "ntfs" | "exfat" | "vfat" | "fat32") {
+                blockers.push(format!(
+                    "staging filesystem {name} cannot be read by Windows Setup; it needs an existing NTFS, exFAT, or FAT32 volume (choose one with --staging-root). NoUSB never creates or resizes partitions"
+                ));
+            }
+            if matches!(lower.as_str(), "vfat" | "fat32") {
+                warnings.push(
+                    "FAT32 holds files up to 4 GiB; Windows 11's install.wim is usually larger and would have to be split".into(),
+                );
+            }
+        }
+        None => warnings.push("staging filesystem is unknown".into()),
+    }
+    if let (Some(free), true) = (facts.staging_free_bytes, iso_size_bytes > 0) {
+        let needed = iso_size_bytes.saturating_add(1024 * 1024 * 1024);
+        if free < needed {
+            blockers.push(format!(
+                "staging volume has {} MiB free; the extracted media needs {} MiB",
+                free / (1024 * 1024),
+                needed / (1024 * 1024)
+            ));
+        }
+    }
+    warnings.push(match facts.os_name.as_str() {
+        "windows" => "from Windows, the route that works today needs no boot change: mount the ISO in Explorer and run setup.exe yourself (Microsoft's supported reinstall or upgrade)".to_string(),
+        _ => "from Linux there is no no-USB route to Windows Setup yet; use Microsoft's own media on a USB stick, or wait for the WinPE route to pass its VM rehearsal".to_string(),
+    });
+
+    let token = format!("{WINDOWS_TARGET_PROFILE_ID}-{}", now_stamp());
+    let label = iso_facts
+        .as_ref()
+        .filter(|found| !found.volume_id.is_empty())
+        .map(|found| format!(" (volume {})", found.volume_id))
+        .unwrap_or_default();
+    HostBootPlan {
+        id: format!("host-boot-{token}"),
+        profile_id: WINDOWS_TARGET_PROFILE_ID.into(),
+        profile_name: format!("Windows Setup{label}"),
+        host_os: facts.os_name.clone(),
+        backend: backend.into(),
+        iso_path: iso.map(Path::to_path_buf).unwrap_or_default(),
+        iso_filename: String::new(),
+        iso_sha256: String::new(),
+        iso_size_bytes,
+        iso_verification: IsoVerification::Unverified,
+        target_kind: BootTargetKind::WindowsSetup,
+        recipe: LiveBootRecipe {
+            family: LiveBootFamily::WindowsSetup,
+            kernel: "/sources/boot.wim".into(),
+            initrds: vec![],
+            kernel_args: vec![],
+            source_config: "Microsoft Windows Setup media (UDF, not inspected)".into(),
+        },
+        ram_copy: false,
+        staging_volume_root: facts.staging_volume_root.clone(),
+        staging_relative_dir: String::new(),
+        grub_iso_path: String::new(),
+        grub_config: String::new(),
+        write_disk_info: false,
+        files: vec![],
+        entry_label: HOST_BOOT_ENTRY_LABEL.into(),
+        loader_path: String::new(),
+        confirmation_phrase: arm_confirmation_phrase(WINDOWS_TARGET_PROFILE_ID),
+        blockers,
+        warnings,
+        steps: vec![
+            "Design only, nothing below is implemented or executed".into(),
+            "Hash the ISO you supply and record its SHA-256".into(),
+            "Extract the media (UDF) to NoUSB/<token>/ on an NTFS, exFAT, or FAT32 volume that Windows Setup can read".into(),
+            "Place Microsoft's signed boot manager, a generated BCD, and boot.sdi on the ESP with a RAM-disk entry for sources/boot.wim (roughly 1 GiB of FAT space)".into(),
+            "Create a firmware entry outside the persistent boot order and select it for one boot".into(),
+            "Windows Setup starts from RAM and reads install.wim from the staging volume; installing stays your choice inside Setup".into(),
+            "Before any host run: prove all of this in a disposable VM, including fallback and power-loss cleanup".into(),
+        ],
+        recovery: vec![
+            "This plan changes nothing: no files, no firmware entry, no boot selector.".into(),
+        ],
+        execution_enabled: false,
+    }
+}
+
+fn plan_from_source(
+    source: BootSource,
+    iso_path: &Path,
+    facts: &HostBootFacts,
+    backend: &str,
+    execution_enabled: bool,
+) -> Result<HostBootPlan, NoUsbError> {
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
+    let pinned = source.verification == IsoVerification::Pinned;
 
-    let iso_size = fs::metadata(iso_path).map(|meta| meta.len()).ok();
-    match iso_size {
-        None => blockers.push(format!(
-            "verified ISO not found at {}; run `nousb image download {profile_id}` first",
-            iso_path.display()
-        )),
-        Some(size) if size != manifest.size_bytes => blockers.push(format!(
-            "{} is {size} bytes, but the pinned artifact is {} bytes",
-            iso_path.display(),
-            manifest.size_bytes
-        )),
-        Some(_) => {}
+    let actual_size = fs::metadata(iso_path)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len());
+    let iso_size_bytes = source.expected_size.or(actual_size).unwrap_or(0);
+    let usable = match (actual_size, source.expected_size) {
+        (None, _) => {
+            blockers.push(format!(
+                "{} ISO not found at {}; {}",
+                if pinned { "verified" } else { "custom" },
+                iso_path.display(),
+                source.missing_hint
+            ));
+            false
+        }
+        (Some(size), Some(expected)) if size != expected => {
+            blockers.push(format!(
+                "{} is {size} bytes, but the pinned artifact is {expected} bytes",
+                iso_path.display()
+            ));
+            false
+        }
+        (Some(0), _) => {
+            blockers.push(format!("{} is empty", iso_path.display()));
+            false
+        }
+        (Some(_), _) => true,
+    };
+
+    let recipe = match (usable, pinned) {
+        (false, _) => placeholder_recipe(&source.placeholder_paths),
+        // Pinned media is known to carry a usable recipe; anything else is a hard error.
+        (true, true) => read_recipe_from_iso(iso_path)?,
+        (true, false) => match read_recipe_from_iso(iso_path) {
+            Ok(recipe) => recipe,
+            Err(error) => {
+                blockers.push(format!(
+                    "{error}. Only casper (Ubuntu family) and dracut (Fedora family) live ISOs can be loop-booted"
+                ));
+                placeholder_recipe(&[])
+            }
+        },
+    };
+    if usable && !pinned {
+        for (iso_file, _, required) in ISO_LOADERS {
+            if required && !iso_has_file(iso_path, iso_file).unwrap_or(false) {
+                blockers.push(format!(
+                    "the ISO has no {iso_file}; it cannot be started through its own signed shim and GRUB"
+                ));
+            }
+        }
+    }
+    if !pinned {
+        warnings.push(match source.verification {
+            IsoVerification::UserSha256 => format!(
+                "custom ISO: arming enforces the SHA-256 you supplied ({}); NoUSB cannot check a vendor signature for it",
+                source.sha256
+            ),
+            _ => "custom ISO without --sha256: its origin is unverified. Compare it with the vendor's checksum file and pass --sha256 <hex>".into(),
+        });
+        warnings.push(
+            "custom ISOs are outside the disposable-VM matrix; if the live system cannot find its medium, reboot and the firmware returns to this OS".into(),
+        );
     }
 
-    let recipe = if iso_size == Some(manifest.size_bytes) {
-        Some(read_recipe_from_iso(iso_path)?)
-    } else {
-        None
-    };
-    let recipe = match recipe {
-        Some(recipe) => recipe,
-        None => placeholder_recipe(&profile.kernel_initrd_paths),
-    };
-
     let (host_blockers, host_warnings) =
-        host_preflight(facts, recipe.family, manifest.size_bytes, execution_enabled);
+        host_preflight(facts, recipe.family, iso_size_bytes, execution_enabled);
     blockers.extend(host_blockers);
     warnings.extend(host_warnings);
 
     let ram_copy = facts
         .memory_total_mb
-        .is_some_and(|memory| memory >= manifest.size_bytes / (1024 * 1024) + RAM_COPY_HEADROOM_MB);
+        .is_some_and(|memory| memory >= iso_size_bytes / (1024 * 1024) + RAM_COPY_HEADROOM_MB);
     if !ram_copy {
         warnings.push(
             "not enough RAM (or unknown) to copy the live medium to RAM; the live session keeps reading the ISO from disk".into(),
         );
     }
 
-    let token = format!("{}-{}", profile.id, now_stamp());
+    let token = format!("{}-{}", source.profile_id, now_stamp());
     let staging_relative_dir = format!("{HOST_BOOT_STAGING_DIR}/{token}");
     let prefix = facts.staging_grub_prefix.trim_end_matches('/');
-    let grub_iso_path = format!("{prefix}/{staging_relative_dir}/{}", manifest.filename);
+    let grub_iso_path = format!("{prefix}/{staging_relative_dir}/{}", source.filename);
     let marker_name = format!("nousb-{token}.marker");
     let grub_marker_path = format!("{prefix}/{staging_relative_dir}/{marker_name}");
     let grub_config = render_grub_config(
-        &profile.name,
+        &source.title,
         &recipe,
         &grub_iso_path,
         &grub_marker_path,
@@ -386,9 +813,9 @@ pub fn plan_host_one_shot(
     let mut files = vec![
         PlannedFile {
             location: "staging".into(),
-            relative_path: format!("{staging_relative_dir}/{}", manifest.filename),
+            relative_path: format!("{staging_relative_dir}/{}", source.filename),
             source: format!("verified copy of {}", iso_path.display()),
-            size_bytes: Some(manifest.size_bytes),
+            size_bytes: Some(iso_size_bytes),
         },
         PlannedFile {
             location: "staging".into(),
@@ -401,7 +828,9 @@ pub fn plan_host_one_shot(
         files.push(PlannedFile {
             location: "esp".into(),
             relative_path: format!("EFI/{HOST_BOOT_ESP_DIR}/{name}"),
-            source: format!("ISO {iso_file} (official, signed; optional files only if present)"),
+            source: format!(
+                "ISO {iso_file} (the ISO's own signed loader; optional files only if present)"
+            ),
             size_bytes: None,
         });
     }
@@ -433,7 +862,18 @@ pub fn plan_host_one_shot(
     let loader_path = format!("\\EFI\\{HOST_BOOT_ESP_DIR}\\BOOTX64.EFI");
     let steps = vec![
         "Re-check elevation, UEFI, staging-volume encryption, and free space".into(),
-        "Re-verify the full ISO against the pinned size and SHA-256".into(),
+        match source.verification {
+            IsoVerification::Pinned => {
+                "Re-verify the full ISO against the pinned size and SHA-256".to_string()
+            }
+            IsoVerification::UserSha256 => {
+                "Hash the full ISO and require the SHA-256 you supplied".to_string()
+            }
+            IsoVerification::Unverified => {
+                "Hash the full ISO and record its SHA-256 (no expected value to compare)"
+                    .to_string()
+            }
+        },
         "Back up firmware boot entries (and the BCD store on Windows) to .nousb/host-boot/<plan>/backup".into(),
         format!(
             "Copy the ISO to {} and verify the copy's SHA-256",
@@ -459,14 +899,17 @@ pub fn plan_host_one_shot(
 
     Ok(HostBootPlan {
         id: format!("host-boot-{token}"),
-        profile_id: profile.id.clone(),
-        profile_name: format!("{} {}", profile.name, profile.version),
+        confirmation_phrase: arm_confirmation_phrase(&source.profile_id),
+        profile_id: source.profile_id,
+        profile_name: source.profile_name,
         host_os: facts.os_name.clone(),
         backend: backend.into(),
         iso_path: iso_path.to_path_buf(),
-        iso_filename: manifest.filename.clone(),
-        iso_sha256: manifest.sha256,
-        iso_size_bytes: manifest.size_bytes,
+        iso_filename: source.filename,
+        iso_sha256: source.sha256,
+        iso_size_bytes,
+        iso_verification: source.verification,
+        target_kind: BootTargetKind::LinuxLive,
         recipe,
         ram_copy,
         staging_volume_root: facts.staging_volume_root.clone(),
@@ -477,7 +920,6 @@ pub fn plan_host_one_shot(
         files,
         entry_label: HOST_BOOT_ENTRY_LABEL.into(),
         loader_path,
-        confirmation_phrase: arm_confirmation_phrase(&profile.id),
         blockers,
         warnings,
         steps,
@@ -585,7 +1027,8 @@ fn placeholder_recipe(kernel_initrd_paths: &[String]) -> LiveBootRecipe {
         .cloned()
         .unwrap_or_else(|| "(read from the ISO once it is downloaded)".into());
     LiveBootRecipe {
-        family: if kernel.starts_with("/casper/") {
+        // With nothing known yet, casper adds no family-specific blocker of its own.
+        family: if kernel.starts_with("/casper/") || kernel_initrd_paths.is_empty() {
             LiveBootFamily::Casper
         } else {
             LiveBootFamily::Dracut
@@ -631,7 +1074,7 @@ pub fn render_grub_config(
         ours.push(
             match recipe.family {
                 LiveBootFamily::Casper => "toram",
-                LiveBootFamily::Dracut => "rd.live.ram=1",
+                LiveBootFamily::Dracut | LiveBootFamily::WindowsSetup => "rd.live.ram=1",
             }
             .into(),
         );
@@ -832,6 +1275,11 @@ fn arm_with_extractor(
             )));
         }
     }
+    if plan.target_kind != BootTargetKind::LinuxLive {
+        return Err(NoUsbError::UnsafeExecution(
+            "this target is plan-only; no build can arm it".into(),
+        ));
+    }
     if !plan.ready() {
         return Err(NoUsbError::UnsafeExecution(format!(
             "preflight blocked: {}",
@@ -953,8 +1401,15 @@ fn run_arm_steps(
     save_state(base_dir, state, "ESP pre-checks passed")?;
 
     // Hash the multi-GiB source only after the cheap ESP checks have passed.
-    verify_file(&plan.iso_path, plan.iso_size_bytes, &plan.iso_sha256)?;
-    save_state(base_dir, state, "source ISO re-verified")?;
+    let source_sha256 = source_digest(plan)?;
+    save_state(
+        base_dir,
+        state,
+        &format!(
+            "source ISO hashed ({}): {source_sha256}",
+            plan.iso_verification.as_str()
+        ),
+    )?;
 
     // Staging volume: NoUSB/<token>/<iso> plus the marker GRUB searches for.
     let staging_parent = plan.staging_volume_root.join(HOST_BOOT_STAGING_DIR);
@@ -974,10 +1429,9 @@ fn run_arm_steps(
     save_state(base_dir, state, "copying ISO")?;
     copy_create_new(&plan.iso_path, &iso_copy)?;
     let copied = sha256_file(&iso_copy)?;
-    if copied != plan.iso_sha256 {
+    if copied != source_sha256 {
         return Err(NoUsbError::Verification(format!(
-            "ISO copy hash {copied} does not match pinned {}",
-            plan.iso_sha256
+            "ISO copy hash {copied} does not match the source's {source_sha256}"
         )));
     }
     let marker_name = plan
@@ -1242,6 +1696,29 @@ fn undo_transaction(
     } else {
         Err(NoUsbError::Io(errors.join("; ")))
     }
+}
+
+/// Hashes the source ISO. With an expected digest (pinned or user-supplied) a mismatch fails;
+/// without one the digest only anchors the staged copy to this exact file.
+fn source_digest(plan: &HostBootPlan) -> Result<String, NoUsbError> {
+    if plan.iso_sha256.is_empty() {
+        if plan.iso_verification != IsoVerification::Unverified {
+            return Err(NoUsbError::Verification(
+                "plan carries no SHA-256 for a verified ISO".into(),
+            ));
+        }
+        let actual_size = fs::metadata(&plan.iso_path)?.len();
+        if actual_size != plan.iso_size_bytes {
+            return Err(NoUsbError::Verification(format!(
+                "{} changed size since planning ({actual_size} bytes, planned {})",
+                plan.iso_path.display(),
+                plan.iso_size_bytes
+            )));
+        }
+        return sha256_file(&plan.iso_path);
+    }
+    verify_file(&plan.iso_path, plan.iso_size_bytes, &plan.iso_sha256)?;
+    Ok(plan.iso_sha256.to_ascii_lowercase())
 }
 
 fn verify_file(path: &Path, size_bytes: u64, sha256: &str) -> Result<(), NoUsbError> {
@@ -1521,6 +1998,337 @@ mod tests {
 
     const UBUNTU_CFG: &str = "set timeout=30\nloadfont unicode\nmenuentry \"Try or Install Ubuntu\" {\n\tset gfxpayload=keep\n\tlinux\t/casper/vmlinuz  --- quiet splash\n\tinitrd\t/casper/initrd\n}\nmenuentry \"Ubuntu (safe graphics)\" {\n\tlinux /casper/vmlinuz nomodeset ---\n\tinitrd /casper/initrd\n}\n";
     const FEDORA_CFG: &str = "set default=\"1\"\nsearch --no-floppy --set=root -l 'Fedora-WS-Live-44-1-7'\nmenuentry 'Start Fedora-Workstation-Live 44' --class fedora {\n\tlinux ($root)/images/pxeboot/vmlinuz root=live:CDLABEL=Fedora-WS-Live-44-1-7 rd.live.image quiet rhgb\n\tinitrd ($root)/images/pxeboot/initrd.img\n}\nmenuentry 'Test this media & start' {\n\tlinux /images/pxeboot/vmlinuz root=live:CDLABEL=Fedora-WS-Live-44-1-7 rd.live.image rd.live.check quiet\n\tinitrd /images/pxeboot/initrd.img\n}\n";
+
+    /// Writes a minimal ISO9660 image. Every directory and every file takes one sector.
+    fn write_test_iso(path: &Path, files: &[(&str, &[u8])]) {
+        const SECTOR: usize = 2048;
+        fn both_u32(target: &mut [u8], value: u32) {
+            target[..4].copy_from_slice(&value.to_le_bytes());
+            target[4..8].copy_from_slice(&value.to_be_bytes());
+        }
+        fn both_u16(target: &mut [u8], value: u16) {
+            target[..2].copy_from_slice(&value.to_le_bytes());
+            target[2..4].copy_from_slice(&value.to_be_bytes());
+        }
+        fn record(lba: usize, size: usize, directory: bool, name: &[u8]) -> Vec<u8> {
+            let length = 33 + name.len() + usize::from(name.len().is_multiple_of(2));
+            let mut record = vec![0_u8; length];
+            record[0] = length as u8;
+            both_u32(&mut record[2..10], lba as u32);
+            both_u32(&mut record[10..18], size as u32);
+            record[18..25].copy_from_slice(&[126, 1, 1, 0, 0, 0, 0]);
+            record[25] = if directory { 2 } else { 0 };
+            both_u16(&mut record[28..32], 1);
+            record[32] = name.len() as u8;
+            record[33..33 + name.len()].copy_from_slice(name);
+            record
+        }
+
+        // Directory paths ("" is the root), parents before children.
+        let mut dirs = vec![String::new()];
+        for (file, _) in files {
+            let parts: Vec<&str> = file.trim_start_matches('/').split('/').collect();
+            for depth in 1..parts.len() {
+                let dir = parts[..depth].join("/");
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        let first = 20;
+        let dir_lba = |dir: &str| first + dirs.iter().position(|known| known == dir).unwrap();
+        let file_lba = |index: usize| first + dirs.len() + index;
+        let parent_of = |path: &str| match path.rsplit_once('/') {
+            Some((parent, _)) => parent.to_string(),
+            None => String::new(),
+        };
+        let leaf_of = |path: &str| path.rsplit('/').next().unwrap().to_ascii_uppercase();
+        let mut image = vec![0_u8; SECTOR * (first + dirs.len() + files.len())];
+
+        let pvd = 16 * SECTOR;
+        image[pvd] = 1;
+        image[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        image[pvd + 6] = 1;
+        image[pvd + 40..pvd + 50].copy_from_slice(b"NOUSB_TEST");
+        let sectors = (image.len() / SECTOR) as u32;
+        both_u32(&mut image[pvd + 80..pvd + 88], sectors);
+        both_u16(&mut image[pvd + 120..pvd + 124], 1);
+        both_u16(&mut image[pvd + 124..pvd + 128], 1);
+        both_u16(&mut image[pvd + 128..pvd + 132], SECTOR as u16);
+        let root = record(first, SECTOR, true, &[0]);
+        image[pvd + 156..pvd + 190].copy_from_slice(&root);
+        image[pvd + 881] = 1;
+        let terminator = 17 * SECTOR;
+        image[terminator] = 255;
+        image[terminator + 1..terminator + 6].copy_from_slice(b"CD001");
+        image[terminator + 6] = 1;
+
+        for dir in &dirs {
+            let mut records = vec![
+                record(dir_lba(dir), SECTOR, true, &[0]),
+                record(dir_lba(&parent_of(dir)), SECTOR, true, &[1]),
+            ];
+            for child in dirs.iter().filter(|child| !child.is_empty()) {
+                if &parent_of(child) == dir {
+                    records.push(record(
+                        dir_lba(child),
+                        SECTOR,
+                        true,
+                        leaf_of(child).as_bytes(),
+                    ));
+                }
+            }
+            for (index, (file, contents)) in files.iter().enumerate() {
+                let file = file.trim_start_matches('/');
+                if &parent_of(file) == dir {
+                    let name = format!("{};1", leaf_of(file));
+                    records.push(record(
+                        file_lba(index),
+                        contents.len(),
+                        false,
+                        name.as_bytes(),
+                    ));
+                }
+            }
+            let mut cursor = dir_lba(dir) * SECTOR;
+            for entry in records {
+                image[cursor..cursor + entry.len()].copy_from_slice(&entry);
+                cursor += entry.len();
+            }
+        }
+        for (index, (_, contents)) in files.iter().enumerate() {
+            let offset = file_lba(index) * SECTOR;
+            image[offset..offset + contents.len()].copy_from_slice(contents);
+        }
+        fs::write(path, image).unwrap();
+    }
+
+    fn write_live_iso(path: &Path, grub_cfg: &str) {
+        write_test_iso(
+            path,
+            &[
+                ("/boot/grub/grub.cfg", grub_cfg.as_bytes()),
+                ("/EFI/BOOT/BOOTX64.EFI", b"signed shim"),
+                ("/EFI/BOOT/grubx64.efi", b"signed grub"),
+                ("/casper/vmlinuz", b"kernel"),
+                ("/casper/initrd", b"initrd"),
+            ],
+        );
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nousb-hb-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn custom_iso_is_planned_from_its_own_grub_config_and_armed() {
+        let dir = scratch("custom");
+        let iso = dir.join("My Distro 1.0.iso");
+        write_live_iso(&iso, UBUNTU_CFG);
+        let plan = plan_host_one_shot_custom(&iso, None, &facts(&dir), "fake", true).unwrap();
+        assert!(plan.ready(), "{:?}", plan.blockers);
+        assert_eq!(plan.profile_id, CUSTOM_PROFILE_ID);
+        assert_eq!(plan.confirmation_phrase, "BOOT ONCE INTO custom");
+        assert_eq!(plan.iso_verification, IsoVerification::Unverified);
+        assert_eq!(plan.target_kind, BootTargetKind::LinuxLive);
+        assert_eq!(plan.recipe.family, LiveBootFamily::Casper);
+        // A name with spaces cannot go into a GRUB command line unquoted.
+        assert_eq!(plan.iso_filename, "custom-live.iso");
+        assert!(plan.grub_config.contains("/custom-live.iso toram") || !plan.ram_copy);
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("origin is unverified")));
+        assert!(plan.preview().contains("--iso"));
+
+        let esp = dir.join("esp");
+        fs::create_dir_all(esp.join("EFI")).unwrap();
+        let mut backend = FakeHostBootBackend::new(facts(&dir), esp.clone());
+        let state =
+            arm_host_one_shot(&dir, &plan, &mut backend, &plan.confirmation_phrase).unwrap();
+        assert_eq!(state.phase, HostBootPhase::Armed);
+        assert!(state
+            .events
+            .iter()
+            .any(|event| event.contains(&sha256_file(&iso).unwrap())));
+        // The loaders on the ESP are the ISO's own files, byte for byte.
+        let loader = esp.join("EFI").join("NoUSB");
+        assert_eq!(
+            fs::read(loader.join("BOOTX64.EFI")).unwrap(),
+            b"signed shim"
+        );
+        assert_eq!(
+            fs::read(loader.join("grubx64.efi")).unwrap(),
+            b"signed grub"
+        );
+        let staged = dir
+            .join(relative_native(&plan.staging_relative_dir))
+            .join("custom-live.iso");
+        assert_eq!(fs::read(&staged).unwrap(), fs::read(&iso).unwrap());
+        assert_eq!(backend.boot_order, vec!["0000", "0001"]);
+
+        let cleaned =
+            cleanup_host_one_shot(&dir, &mut backend, CLEANUP_CONFIRMATION_PHRASE).unwrap();
+        assert_eq!(cleaned.phase, HostBootPhase::CleanedUp);
+        assert!(!staged.exists() && !loader.exists());
+        assert!(backend.boot_next.is_none() && backend.entries.len() == 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_iso_with_a_supplied_sha256_must_match_it() {
+        let dir = scratch("custom-sha");
+        let iso = dir.join("distro-live.iso");
+        write_live_iso(&iso, UBUNTU_CFG);
+        assert!(plan_host_one_shot_custom(&iso, Some("abc"), &facts(&dir), "fake", true).is_err());
+
+        let right = sha256_file(&iso).unwrap().to_ascii_uppercase();
+        let plan =
+            plan_host_one_shot_custom(&iso, Some(&right), &facts(&dir), "fake", true).unwrap();
+        assert_eq!(plan.iso_verification, IsoVerification::UserSha256);
+        assert_eq!(plan.iso_filename, "distro-live.iso");
+        assert_eq!(source_digest(&plan).unwrap(), right.to_ascii_lowercase());
+
+        let wrong = "0".repeat(64);
+        let plan =
+            plan_host_one_shot_custom(&iso, Some(&wrong), &facts(&dir), "fake", true).unwrap();
+        let esp = dir.join("esp");
+        fs::create_dir_all(esp.join("EFI")).unwrap();
+        let mut backend = FakeHostBootBackend::new(facts(&dir), esp.clone());
+        let error =
+            arm_host_one_shot(&dir, &plan, &mut backend, &plan.confirmation_phrase).unwrap_err();
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert!(error.to_string().contains("expected"), "{error}");
+        assert!(!dir.join("NoUSB").exists());
+        assert!(!esp.join("EFI").join("NoUSB").exists());
+        assert!(backend.boot_next.is_none() && backend.entries.len() == 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_iso_that_cannot_be_loop_booted_is_blocked_not_guessed() {
+        let dir = scratch("custom-bad");
+        let other = dir.join("other.iso");
+        write_live_iso(
+            &other,
+            "menuentry x {\n linux /live/vmlinuz boot=live findiso=${iso_path}\n initrd /live/initrd\n}\n",
+        );
+        let plan = plan_host_one_shot_custom(&other, None, &facts(&dir), "fake", true).unwrap();
+        assert!(!plan.ready());
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("Only casper")));
+
+        let bare = dir.join("bare.iso");
+        write_test_iso(&bare, &[("/boot/grub/grub.cfg", UBUNTU_CFG.as_bytes())]);
+        let plan = plan_host_one_shot_custom(&bare, None, &facts(&dir), "fake", true).unwrap();
+        let text = plan.blockers.join("\n");
+        assert!(text.contains("no /EFI/BOOT/BOOTX64.EFI"), "{text}");
+        assert!(text.contains("no /EFI/BOOT/grubx64.efi"), "{text}");
+
+        let missing =
+            plan_host_one_shot_custom(&dir.join("nope.iso"), None, &facts(&dir), "fake", true)
+                .unwrap();
+        assert!(missing.blockers[0].contains("custom ISO not found"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_requests_are_routed_by_profile() {
+        let dir = scratch("route");
+        let host = facts(&dir);
+        let custom = plan_host_boot(&dir, "custom", None, None, &host, "fake", true).unwrap_err();
+        assert!(custom.to_string().contains("--iso"));
+        let pinned = plan_host_boot(
+            &dir,
+            "ubuntu-24.04-server",
+            None,
+            Some(&"0".repeat(64)),
+            &host,
+            "fake",
+            true,
+        )
+        .unwrap_err();
+        assert!(pinned.to_string().contains("custom profile only"));
+        let cached =
+            plan_host_boot(&dir, "ubuntu-24.04-server", None, None, &host, "fake", true).unwrap();
+        assert!(cached.blockers[0].contains(".nousb"));
+        assert!(cached.blockers[0].contains("--iso"));
+        assert!(plan_host_boot(&dir, "no-such", None, None, &host, "fake", true).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_setup_is_plan_only_and_can_never_be_armed() {
+        let dir = scratch("windows");
+        let iso = dir.join("Win11.iso");
+        let mut image = vec![0_u8; 2048 * 24];
+        for (sector, kind, id) in [
+            (16, 1_u8, b"CD001"),
+            (17, 255, b"CD001"),
+            (18, 0, b"BEA01"),
+            (19, 0, b"NSR03"),
+            (20, 0, b"TEA01"),
+        ] {
+            image[sector * 2048] = kind;
+            image[sector * 2048 + 1..sector * 2048 + 6].copy_from_slice(id);
+        }
+        image[16 * 2048 + 40..16 * 2048 + 51].copy_from_slice(b"CCCOMA_X64F");
+        fs::write(&iso, &image).unwrap();
+        let found = inspect_windows_iso(&iso).unwrap();
+        assert!(found.udf);
+        assert_eq!(found.volume_id, "CCCOMA_X64F");
+
+        // ext4 host: Windows Setup could not read the staging volume.
+        let plan = plan_host_boot(
+            &dir,
+            "windows-11",
+            Some(iso.as_path()),
+            None,
+            &facts(&dir),
+            "fake",
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.target_kind, BootTargetKind::WindowsSetup);
+        assert!(!plan.ready() && !plan.execution_enabled && plan.files.is_empty());
+        let text = plan.blockers.join("\n");
+        assert!(text.contains("plan-only"), "{text}");
+        assert!(
+            text.contains("ext4 cannot be read by Windows Setup"),
+            "{text}"
+        );
+        assert!(plan.preview().contains("Arming is refused"));
+        serde_json::from_str::<serde_json::Value>(&plan.to_json()).unwrap();
+
+        // Even with every blocker stripped, arm refuses the target kind.
+        let mut forced = plan.clone();
+        forced.blockers.clear();
+        let mut backend = FakeHostBootBackend::new(facts(&dir), dir.join("esp"));
+        let error = arm_host_one_shot(&dir, &forced, &mut backend, &forced.confirmation_phrase)
+            .unwrap_err();
+        assert!(error.to_string().contains("plan-only"));
+        assert!(backend.boot_next.is_none() && backend.entries.len() == 2);
+
+        let none = plan_windows_setup_target(None, &facts(&dir), "fake");
+        assert!(none
+            .blockers
+            .iter()
+            .any(|b| b.contains("no Windows ISO given")));
+        let linux_iso = dir.join("linux.iso");
+        write_live_iso(&linux_iso, UBUNTU_CFG);
+        let not_windows =
+            plan_windows_setup_target(Some(linux_iso.as_path()), &facts(&dir), "fake");
+        assert!(not_windows
+            .blockers
+            .iter()
+            .any(|b| b.contains("no UDF file system")));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn derives_casper_recipe_from_the_first_entry() {

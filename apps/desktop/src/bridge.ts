@@ -71,11 +71,35 @@ export interface VmEvidence {
   report: Record<string, unknown>;
 }
 
+export interface ImageStatus {
+  profile_id: string;
+  path: string;
+  size_bytes: number;
+  present: boolean;
+  partial_bytes: number;
+  downloading: boolean;
+}
+
+/** Options that pick the ISO and where it is staged. Empty strings mean "use the default". */
+export interface BootSource {
+  stagingRoot?: string;
+  iso?: string;
+  sha256?: string;
+}
+
+export const CUSTOM_PROFILE = "custom";
+export const WINDOWS_PROFILE = "windows-11";
+export const downloadPhrase = (profile: string): string => `DOWNLOAD ${profile}`;
+
 export interface HostBootPlan {
   id: string;
   profile_id: string;
   profile_name: string;
   backend: string;
+  iso_path: string;
+  iso_size_bytes: number;
+  iso_verification: "pinned" | "user_sha256" | "unverified";
+  target_kind: "linux_live" | "windows_setup";
   recipe: { family: string; kernel: string; source_config: string };
   ram_copy: boolean;
   staging_volume_root: string;
@@ -100,11 +124,14 @@ export interface HostBootState {
 export const CLEANUP_PHRASE = "CLEAN UP NOUSB BOOT";
 
 export const bridge = {
-  hostBootPlan: (profile: string, stagingRoot?: string) =>
-    call<HostBootPlan>("host_boot_plan", { profile, stagingRoot }),
+  hostBootPlan: (profile: string, source: BootSource = {}) =>
+    call<HostBootPlan>("host_boot_plan", { profile, ...source }),
+  imageStatus: (profile: string) => call<ImageStatus>("image_status", { profile }),
+  imageDownload: (profile: string, confirmation: string) =>
+    call<Record<string, unknown>>("image_download", { profile, confirmation }),
   hostBootStatus: () => call<HostBootState | null>("host_boot_status"),
-  hostBootArm: (profile: string, confirmation: string, stagingRoot?: string) =>
-    call<HostBootState>("host_boot_arm", { profile, confirmation, stagingRoot }),
+  hostBootArm: (profile: string, confirmation: string, source: BootSource = {}) =>
+    call<HostBootState>("host_boot_arm", { profile, confirmation, ...source }),
   hostBootCleanup: (confirmation: string) =>
     call<HostBootState>("host_boot_cleanup", { confirmation }),
   inventory: () => call<Inventory>("inventory"),

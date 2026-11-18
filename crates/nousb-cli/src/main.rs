@@ -2,18 +2,18 @@
 use nousb_core::HostPlatform;
 mod tui;
 use nousb_core::{
-    acquire_qemu_windows_runtime, arm_host_one_shot, artifact_cache_path, artifact_manifest,
-    assess_delivery, assess_recovery, built_in_profiles, cleanup_host_one_shot,
-    create_recovery_pack, create_staging_bundle, download_artifact, embedded_profiles,
-    execute_plan_safe, export_diagnostic_bundle, inspect_staging_artifact,
-    list_saved_execution_reports, load_execution_report, load_execution_report_json,
-    load_host_boot_state, plan_host_one_shot, plan_operation, plan_operation_for_inventory,
-    probe_artifact, qemu_runtime_cache_path, qemu_windows_runtime_manifest, rehearse_vm_one_shot,
-    resume_simulated_report, rollback_simulated_report, save_execution_report, save_vm_rehearsal,
-    verify_artifact, verify_sha256_with_system_tool, write_journal_entry, FakePlatformAdapter,
-    HostBootBackend, HostBootFacts, HostBootPlan, NoUsbError, OneShotBootBackend,
-    OperationExecutor, OperationKind, PlatformAdapter, RecoveryAction, SavedExecutionReportSummary,
-    SimulatedExecutor, SimulationConfig, SystemInventory, CLEANUP_CONFIRMATION_PHRASE,
+    acquire_qemu_windows_runtime, arm_host_one_shot, artifact_manifest, assess_delivery,
+    assess_recovery, built_in_profiles, cleanup_host_one_shot, create_recovery_pack,
+    create_staging_bundle, download_artifact, embedded_profiles, execute_plan_safe,
+    export_diagnostic_bundle, inspect_staging_artifact, list_saved_execution_reports,
+    load_execution_report, load_execution_report_json, load_host_boot_state, plan_host_boot,
+    plan_operation, plan_operation_for_inventory, probe_artifact, qemu_runtime_cache_path,
+    qemu_windows_runtime_manifest, rehearse_vm_one_shot, resume_simulated_report,
+    rollback_simulated_report, save_execution_report, save_vm_rehearsal, verify_artifact,
+    verify_sha256_with_system_tool, write_journal_entry, FakePlatformAdapter, HostBootBackend,
+    HostBootFacts, HostBootPlan, NoUsbError, OneShotBootBackend, OperationExecutor, OperationKind,
+    PlatformAdapter, RecoveryAction, SavedExecutionReportSummary, SimulatedExecutor,
+    SimulationConfig, SystemInventory, CLEANUP_CONFIRMATION_PHRASE,
 };
 use std::env;
 use std::fs;
@@ -290,6 +290,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("source reachable: {}", probe.final_url);
                 println!("content_length: {:?}", probe.content_length);
                 println!("accepts_ranges: {}", probe.accepts_ranges);
+            }
+        }
+        [cmd, sub, profile] if cmd == "image" && sub == "status" => {
+            let status = nousb_core::artifact_status(&cwd, profile)?;
+            if options.json {
+                println!("{}", status.to_json());
+            } else {
+                println!("profile: {}", status.profile_id);
+                println!("path: {}", status.path.display());
+                println!("pinned_size_bytes: {}", status.size_bytes);
+                println!("present: {}", status.present);
+                println!("partial_bytes: {}", status.partial_bytes);
+                println!("downloading: {}", status.downloading);
+                if !status.present {
+                    println!(
+                        "Get it with `nousb image download {profile}`, or use a copy you already have: nousb boot plan {profile} --iso <path>"
+                    );
+                }
             }
         }
         [cmd, sub, profile] if cmd == "image" && sub == "download" => {
@@ -1233,14 +1251,12 @@ fn host_boot_plan(
     profile: &str,
     options: &CliOptions,
 ) -> Result<HostBootPlan, Box<dyn std::error::Error>> {
-    let iso = match &options.iso {
-        Some(path) => path.clone(),
-        None => artifact_cache_path(cwd, profile)?,
-    };
     let facts = read_host_boot_facts(&staging_root(options))?;
-    Ok(plan_host_one_shot(
+    Ok(plan_host_boot(
+        cwd,
         profile,
-        &iso,
+        options.iso.as_deref(),
+        options.sha256.as_deref(),
         &facts,
         host_boot_backend_name(),
         real_boot_compiled(),
@@ -1471,6 +1487,7 @@ struct CliOptions {
     interrupt_after: Option<usize>,
     fail_step: Option<String>,
     iso: Option<PathBuf>,
+    sha256: Option<String>,
     staging_root: Option<PathBuf>,
     args: Vec<String>,
 }
@@ -1484,6 +1501,7 @@ impl CliOptions {
         let mut interrupt_after = None;
         let mut fail_step = None;
         let mut iso = None;
+        let mut sha256 = None;
         let mut staging_root = None;
         let mut args = Vec::new();
         let mut index = 0usize;
@@ -1508,6 +1526,13 @@ impl CliOptions {
                         return Err("--fail-step requires a step id".into());
                     };
                     fail_step = Some(value.clone());
+                }
+                "--sha256" => {
+                    index += 1;
+                    let Some(value) = raw_args.get(index) else {
+                        return Err("--sha256 requires the expected SHA-256 hex digest".into());
+                    };
+                    sha256 = Some(value.clone());
                 }
                 "--iso" | "--staging-root" => {
                     index += 1;
@@ -1537,6 +1562,7 @@ impl CliOptions {
             interrupt_after,
             fail_step,
             iso,
+            sha256,
             staging_root,
             args,
         })
@@ -1717,7 +1743,10 @@ fn print_help() {
     println!("  nousb resume <plan-id>");
     println!("  nousb diagnostics export");
     println!("  nousb dashboard export");
+    println!("  nousb image status <profile>");
     println!("  nousb boot plan <profile> [--iso <path>] [--staging-root <volume-root>]");
+    println!("  nousb boot plan custom --iso <linux-live.iso> [--sha256 <hex>]  (your own ISO)");
+    println!("  nousb boot plan windows-11 [--iso <windows.iso>]  (plan-only, never armed)");
     println!(
         "  nousb boot arm <profile> \"BOOT ONCE INTO <profile>\"  (real-boot build, elevated)"
     );
@@ -1738,6 +1767,7 @@ fn print_help() {
     println!("  --fail-step <step-id>");
     println!("  --rollback   Roll back the simulated report");
     println!("  --iso <path>             ISO for boot plan/arm (default: .nousb/artifacts/...)");
+    println!("  --sha256 <hex>           Expected SHA-256 of a custom ISO, from the vendor");
     println!("  --staging-root <root>    Unencrypted volume root for the ISO copy (C:\\ or /)");
     println!();
     println!("Fake scenarios:");
